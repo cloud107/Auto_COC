@@ -1,0 +1,57 @@
+{
+  "town_hall_level": 19,
+  "retrieved_on": "2026-11-23",
+  "distance_unit": "tile",
+  "sources": {
+    "client_buildings": "https://assets.clashk.ing/static_data/buildings.json",
+    "client_guardians": "https://assets.clashk.ing/static_data/guardians.json",
+    "client_heroes": "https://assets.clashk.ing/static_data/heroes.json",
+    "client_data_extractor": "https://github.com/ClashKingInc/ClashKingAssets/blob/main/update_static.py",
+    "supercell_th19": "https://supercell.com/en/games/clashofclans/blog/release-notes/the-clash-of-titans-update-is-rolling-out/",
+    "supercell_firespitter": "https://supercell.com/en/games/clashofclans/blog/game-updates/the-town-hall-17-update-is-here-2/",
+    "supercell_builder_hut": "https://supercell.com/en/games/clashofclans/blog/game-updates/battle-builders-2/",
+    "supercell_crafted_defenses": "https://supercell.com/en/games/clashofclans/blog/release-notes/welcome-to-lets-get-crafty-update/"
+  },
+  "defenses": {
+    "town_hall": {"kind": "spawns_defenders"},
+    "inferno_tower": {"kind": "direct", "modes": {
+      "single": {"range": 9, "targets": ["ground", "air"]},
+      "multi": {"range": 10, "targets": ["ground", "air"]}
+    }},
+    "scattershot": {"kind": "direct", "range": 10, "min_range": 3, "targets": ["ground", "air"]},
+    "monolith": {"kind": "direct", "range": 11, "targets": ["ground", "air"]},
+    "spell_tower": {"kind": "spell", "modes": {
+      "rage": {"trigger_range": 9, "effect_radius": 5},
+      "poison": {"trigger_range": 9, "effect_radius": 5},
+      "invisibility": {"trigger_range": 4.5, "effect_radius": 4.5},
+      "earthquake": {"trigger_range": 9, "effect_radius": 4.7}
+    }},
+    "x_bow": {"kind": "direct", "modes": {
+      "ground": {"range": 14, "targets": ["ground"]},
+      "ground_and_air": {"range": 11.5, "targets": ["ground", "air"]}
+    }},
+    "air_defense": {"kind": "direct", "range": 10, "targets": ["air"]},
+    "ricochet_cannon": {"kind": "direct", "range": 9, "targets": ["ground"]},
+    "multi_archer_tower": {"kind": "direct", "range": 10, "targets": ["ground", "air"]},
+    "firespitter": {"kind": "directional", "range": 16, "cone_angle_deg": 150, "targets": ["ground", "air"]},
+    "revenge_tower": {"kind": "direct", "range": 11, "targets": ["ground", "air"]},
+    "spiky_tower": {"kind": "retaliation", "wake_range": 11},
+    "firecracker_tower": {"kind": "direct", "range": 10, "targets": ["ground", "air"]},
+    "air_sweeper": {"kind": "pushback", "range": 15, "min_range": 1, "cone_angle_deg": 105, "targets": ["air"]},
+    "multi_gear_tower": {"kind": "direct", "modes": {
+      "long_range": {"range": 12, "targets": ["ground", "air"]},
+      "fast_attack": {"range": 8, "targets": ["ground", "air"]}
+    }},
+    "mortar": {"kind": "direct", "range": 11, "min_range": 4, "targets": ["ground"]},
+    "bomb_tower": {"kind": "direct", "range": 6, "targets": ["ground"]},
+    "clan_castle": {"kind": "spawns_defenders", "trigger_range": 13},
+    "builder_hut": {"kind": "direct", "range": 7, "min_armed_level": 2, "targets": ["ground", "air"]},
+    "super_wizard_tower": {"kind": "direct", "range": 8, "targets": ["ground", "air"]},
+    "hidden_tesla": {"kind": "direct", "range": 7, "requires_revealed": true, "targets": ["ground", "air"]},
+    "guardian_shrine": {"kind": "spawns_guardian"},
+    "guardian_longshot": {"kind": "mobile", "range": 11, "targets": ["ground", "air"]},
+    "guardian_smasher": {"kind": "mobile", "range": 1.25, "targets": ["ground", "air"]},
+    "guardian_log_thrower": {"kind": "mobile", "range": 7, "targets": ["ground", "air"]},
+    "crafted_defense": {"kind": "subtype_required"}
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "adb": "D:/MuMuPlayer/nx_main/adb.exe",
+  "serial": "127.0.0.1:16384",
+  "device": "auto",
+  "output_dir": "runs"
+}

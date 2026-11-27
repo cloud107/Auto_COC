@@ -1,0 +1,40 @@
+# Python / OS / IDE
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+yolo-cuda/
+.DS_Store
+.agents/
+
+# Local user config & run outputs
+config.json
+runs/
+destruction-ocr-*/
+mumu-zoom-result.txt
+*.mp4
+*.npz
+
+# Training data, experiment scripts, and scratch notes
+datasets/
+TASKS.md
+review_healing.py
+train_all_buildings.ps1
+zoom_mumu_out.ps1
+
+# Keep only the active production YOLO weights
+models/*
+!models/realistic-defense24-yolo26m-self-20261125.pt
+
+# Keep only required HUD templates and calibration reference assets
+captures/*
+!captures/self-attack-current-army-predeploy.png
+!captures/self-attack-battle-hud.png
+!captures/self-attack-result-hud.png
+!captures/ice-block-selected-one.png
+!captures/heal-selected-one.png
+!captures/yolo26s-self-loop/
+captures/yolo26s-self-loop/*
+!captures/yolo26s-self-loop/pre.png
+!captures/yolo26s-self-loop/calibration.json
