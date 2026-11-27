@@ -43,35 +43,43 @@ WARDEN_RING_TEMPLATE = _make_warden_ring_template(70.0)
 
 
 def detect_troop_health_bars(image, pre_bgr, roi):
-    """Detect green, yellow, and red/orange health bars while rejecting static pre-battle background."""
+    """Detect green, yellow, and red/orange health bars (including bars washed by golden Heal glow)."""
     left, top, right, bottom = roi
     if right <= left + 8 or bottom <= top + 8:
         return []
     region = image[top:bottom, left:right]
     pre_reg = pre_bgr[top:bottom, left:right]
     hue, sat, val = cv2.split(cv2.cvtColor(region, cv2.COLOR_BGR2HSV))
-    dark = val < 88
+    dark_strict = val < 92
+    dark_soft = val < 116
     diff_pre = np.abs(region.astype(np.int16) - pre_reg.astype(np.int16)).mean(axis=2)
 
+    # (color_name, fill_mask, dark_mask, min_outline, min_diff_pre, max_w, max_h)
     specs = (
-        ("green", (hue >= 44) & (hue <= 69) & (sat >= 145) & (val >= 130), 0.24, 45, 5),
-        ("yellow", (hue >= 19) & (hue <= 36) & (sat >= 150) & (val >= 165), 0.34, 28, 4),
-        ("red", ((hue <= 18) | (hue >= 170)) & (sat >= 155) & (val >= 135), 0.36, 26, 4),
+        ("green", (hue >= 44) & (hue <= 70) & (sat >= 140) & (val >= 130), dark_strict, 0.22, 16.0, 45, 5),
+        # Golden Heal spell shifts green bars slightly yellower (H 37..44), lowers S, and brightens the dark border.
+        ("green", (hue >= 37) & (hue <= 70) & (sat >= 105) & (val >= 175), dark_soft, 0.28, 22.0, 45, 6),
+        ("yellow", (hue >= 19) & (hue <= 36) & (sat >= 150) & (val >= 165), dark_strict, 0.34, 16.0, 28, 4),
+        ("red", ((hue <= 18) | (hue >= 170)) & (sat >= 155) & (val >= 135), dark_strict, 0.36, 16.0, 26, 4),
     )
     bars = []
-    for color_name, fill, min_outline, max_w, max_h in specs:
+    for color_name, fill, dark_mask, min_outline, min_diff, max_w, max_h in specs:
         _, _, stats, _ = cv2.connectedComponentsWithStats(fill.astype(np.uint8))
         for x, y, w, h, area in stats[1:]:
-            if not (5 <= w <= max_w and 1 <= h <= max_h and w >= 2.2 * h and area >= 0.55 * w * h):
+            if not (5 <= w <= max_w and 1 <= h <= max_h and w >= 2.0 * h and area >= 0.52 * w * h):
                 continue
             if y < 2 or y + h + 3 > region.shape[0]:
                 continue
-            outline = max(dark[y - 2:y, x:x + w].mean(), dark[y + h:y + h + 3, x:x + w].mean())
+            outline = max(dark_mask[y - 2:y, x:x + w].mean(), dark_mask[y + h:y + h + 3, x:x + w].mean())
             if outline < min_outline:
                 continue
-            if diff_pre[y:y + h, x:x + w].mean() < 16.0:
+            if diff_pre[y:y + h, x:x + w].mean() < min_diff:
                 continue
-            bars.append((int(left + x), int(top + y), int(w), int(h), color_name))
+            bx, by = int(left + x), int(top + y)
+            # Deduplicate overlapping bars between strict and Heal-washed green passes
+            if any(abs(bx - ex) <= 6 and abs(by - ey) <= 4 for ex, ey, _, _, _ in bars):
+                continue
+            bars.append((bx, by, int(w), int(h), color_name))
     return bars
 
 
@@ -131,12 +139,14 @@ class HealingWaveTracker:
             self.warden_kf = _Kalman2D(warden_seed, pos_std=20.0, vel_std=35.0, damping=1.0)
             self.warden_seen = None
             self.warden_psr = 0.0
+            self.warden_empty_since = None
             self.army_kf = _Kalman2D(seed, speed, pos_std=22.0, vel_std=55.0, damping=0.8)
             self.army_bar_seen = None
             self.army_motion_seen = None
             self.army_radius = 45.0
             self.offset = seed - warden_seed
             self.prev_small = None
+            self.motion_ema = None
         else:
             # Legacy fallback when no pre-battle reference image is provided.
             self.tracks = DeployedWaveTracks(deployed_at, seed, speed, observation_gap=.62,
@@ -152,7 +162,15 @@ class HealingWaveTracker:
     def _detect_warden(self, fr_small, pre_small, now):
         pred = self.warden_kf.predict(now, q_pos=10.0, q_vel=30.0)
         diff = fr_small - pre_small
-        pos_map = np.clip(diff.mean(axis=2), 0, 50) / 50.0
+        # Grand Warden's aura is bright pale green-white (G >= B and G >= R).
+        # Strongly suppress cyan/blue Freeze & Ice Golem frost rings (B > G) and magenta Rage rings (R,B > G)
+        # so spell rings can NEVER hijack the Warden anchor!
+        db, dg, dr = diff[:, :, 0], diff[:, :, 1], diff[:, :, 2]
+        pos_map = np.clip(
+            dg - np.maximum(0.0, db - dg) * 1.8 - np.maximum(0.0, dr - dg) * 1.2,
+            0.0,
+            50.0,
+        ) / 50.0
         pos_map[:35, :] = 0
         pos_map[410:, :] = 0
         # Mask out the bottom-right 1x speed button & destruction HUD so they never create false ring peaks
@@ -170,7 +188,7 @@ class HealingWaveTracker:
         res_masked = np.where(in_diamond, res, -1e9).astype(np.float32)
 
         gap = (now - self.warden_seen) if self.warden_seen is not None else max(0.0, now - self.deployed_at)
-        rad = min(200, 48 + 65 * max(0.1, gap))
+        rad = min(180, 48 + 55 * max(0.1, gap))
         px = int(round(pred[0] / 2)) - tw // 2
         py = int(round(pred[1] / 2)) - th // 2
         r = int(round(rad / 2))
@@ -185,23 +203,23 @@ class HealingWaveTracker:
                 psr = (maxv - mean_v) / std_v
                 det = np.array([(mx + tw // 2) * 2.0, (my + th // 2) * 2.0])
 
-        # Global reacquire inside the playable diamond if local failed (tightened once locked so Siege/Heal rings can't hijack!)
-        if psr < 5.2 and (self.warden_seen is None or gap >= 0.45):
+        # Global reacquire inside the playable diamond if local failed (tightened on initial lock to block flank frost!)
+        if psr < 5.0 and (self.warden_seen is None or gap >= 0.6):
             _, gmax, _, (gx, gy) = cv2.minMaxLoc(res_masked)
             if gmax > -1e8:
                 gpsr = (gmax - mean_v) / std_v
                 gdet = np.array([(gx + tw // 2) * 2.0, (gy + th // 2) * 2.0])
-                max_jump = 180.0 if self.warden_seen is None else min(160.0, 55.0 + 55.0 * gap)
-                if gpsr >= 6.8 and np.linalg.norm(gdet - pred) <= max_jump:
+                max_jump = 125.0 if self.warden_seen is None else min(170.0, 55.0 + 55.0 * gap)
+                if gpsr >= 6.2 and np.linalg.norm(gdet - pred) <= max_jump:
                     det, psr = gdet, gpsr
 
         self.warden_psr = psr
-        if det is not None and psr >= 4.8:
-            if self.warden_seen is None or np.linalg.norm(det - pred) <= max(45.0, 60.0 * max(0.1, gap)):
-                self.warden_kf.update(det, sigma=10.0 if psr >= 7.0 else 16.0, max_speed=65.0)
+        if det is not None and psr >= 4.5:
+            if self.warden_seen is None or np.linalg.norm(det - pred) <= max(45.0, 58.0 * max(0.1, gap)):
+                self.warden_kf.update(det, sigma=10.0 if psr >= 6.5 else 16.0, max_speed=65.0)
                 self.warden_seen = now
                 return self.warden_kf.state[:2].copy(), True
-        return self.warden_kf.state[:2].copy(), (self.warden_seen is not None and (now - self.warden_seen) <= 2.5)
+        return self.warden_kf.state[:2].copy(), (self.warden_seen is not None and (now - self.warden_seen) <= 2.2)
 
     @staticmethod
     def _cluster_bars(points, max_dist=78.0):
@@ -232,25 +250,48 @@ class HealingWaveTracker:
             return None
         frame_diff = np.abs(fr_small - self.prev_small).mean(axis=2)
         pre_diff = np.abs(fr_small - pre_small).mean(axis=2)
-        active = np.clip(frame_diff - 10.0, 0, 50) * (pre_diff > 15.0)
-        active[:35, :] = 0
-        active[410:, :] = 0
+        # Softly saturate motion per pixel in [0, 1] so bright explosions/flashes don't outweigh moving troops!
+        active = np.clip((frame_diff - 12.0) / 18.0, 0.0, 1.0) * (pre_diff > 16.0)
+        # Mask out bright white/silver UI popups (1-star / 2-star "爽!" banner!) & blue Freeze / magenta Rage flashes
+        hsv_s = cv2.cvtColor(np.clip(fr_small, 0, 255).astype(np.uint8), cv2.COLOR_BGR2HSV)
+        b_ch, g_ch, r_ch = fr_small[:, :, 0], fr_small[:, :, 1], fr_small[:, :, 2]
+        popup_or_flash = (
+            ((hsv_s[:, :, 2] > 228) & (hsv_s[:, :, 1] < 48))  # silver star banner & white flash cores
+            | ((b_ch - g_ch) > 28.0)                           # cyan/blue Freeze & Ice explosions
+            | (((r_ch - g_ch) > 32.0) & ((b_ch - g_ch) > 20.0))  # magenta Rage flashes
+        )
+        active[popup_or_flash] = 0.0
+        active[:35, :] = 0.0
+        active[410:, :] = 0.0
+
         yy, xx = np.ogrid[:480, :600]
         if warden_active:
             wx, wy = warden_pos[0] / 2.0, warden_pos[1] / 2.0
             # Mask out Warden's feet and upper body/cape (which extends ~25px above aura center).
-            active[((xx - wx) / 14.0) ** 2 + ((yy - (wy - 12.0)) / 22.0) ** 2 < 1.0] = 0
-            active[(xx - wx) ** 2 + (yy - wy) ** 2 > 95 ** 2] = 0
+            active[((xx - wx) / 14.0) ** 2 + ((yy - (wy - 12.0)) / 22.0) ** 2 < 1.0] = 0.0
+            disk = (xx - wx) ** 2 + (yy - wy) ** 2 <= 80 ** 2
         else:
             ax, ay = army_pred[0] / 2.0, army_pred[1] / 2.0
-            active[(xx - ax) ** 2 + (yy - ay) ** 2 > 80 ** 2] = 0
+            disk = (xx - ax) ** 2 + (yy - ay) ** 2 <= 65 ** 2
+        active[~disk] = 0.0
 
-        blurred = cv2.GaussianBlur(active.astype(np.float32), (0, 0), 14.0)
+        # Reject sudden frame-wide explosion/star-banner bursts (>35% of search disk lighting up at once)
+        disk_area = max(1, int(np.count_nonzero(disk)))
+        if float(np.count_nonzero(active > 0.25)) / disk_area > 0.35:
+            return None
+
+        blurred = cv2.GaussianBlur(active.astype(np.float32), (0, 0), 13.0)
+        # Temporal EMA suppresses 1-frame projectiles/explosions while preserving steady troop movement
+        if self.motion_ema is None or self.motion_ema.shape != blurred.shape:
+            self.motion_ema = blurred.copy()
+        else:
+            self.motion_ema = 0.55 * self.motion_ema + 0.45 * blurred
+
         ax, ay = army_pred[0] / 2.0, army_pred[1] / 2.0
-        prior = np.exp(-0.5 * ((xx - ax) ** 2 + (yy - ay) ** 2) / (65.0 ** 2))
-        score_map = blurred * (0.35 + 0.65 * prior)
+        prior = np.exp(-0.5 * ((xx - ax) ** 2 + (yy - ay) ** 2) / (45.0 ** 2))
+        score_map = self.motion_ema * (0.25 + 0.75 * prior)
         _, maxv, _, (mx, my) = cv2.minMaxLoc(score_map)
-        if maxv < 1.2:
+        if maxv < 0.045:
             return None
         return np.array([mx * 2.0, my * 2.0])
 
@@ -273,47 +314,73 @@ class HealingWaveTracker:
         else:
             warden_pos, warden_active = None, False
 
-        army_pred = self.army_kf.predict(now, q_pos=16.0, q_vel=55.0)
-        if warden_active and self.army_bar_seen is not None and (now - self.army_bar_seen) > 0.35:
+        army_pred = self.army_kf.predict(now, q_pos=14.0, q_vel=45.0)
+        bar_gap = (now - self.army_bar_seen) if self.army_bar_seen is not None else (now - self.deployed_at)
+        if warden_active and self.army_bar_seen is not None and bar_gap > 0.35:
             army_pred = 0.65 * army_pred + 0.35 * (warden_pos + self.offset)
 
-        anchors = [army_pred]
-        if warden_active:
-            anchors.append(warden_pos)
-        rad_roi = (215 if warden_active
-                   else min(280, 150 + 40 * max(0.0, now - (self.army_bar_seen or self.deployed_at))))
-        lo = np.rint(np.min(anchors, axis=0) - rad_roi).astype(int)
-        hi = np.rint(np.max(anchors, axis=0) + rad_roi).astype(int)
-        roi = (max(0, lo[0]), max(75, lo[1]), min(VIEWPORT[0], hi[0]), min(820, hi[1]))
+        # If bars haven't been seen for >=1.2s, expand to a full-battlefield bar scan so a drifted/hijacked
+        # Warden or fast army jump can NEVER blind us to a real cluster of green troop health bars!
+        if bar_gap >= 1.2:
+            roi = (60, 75, VIEWPORT[0] - 60, 820)
+        else:
+            anchors = [army_pred]
+            if warden_active:
+                anchors.append(warden_pos)
+            rad_roi = 225 if warden_active else min(280, 165 + 40 * max(0.0, bar_gap))
+            lo = np.rint(np.min(anchors, axis=0) - rad_roi).astype(int)
+            hi = np.rint(np.max(anchors, axis=0) + rad_roi).astype(int)
+            roi = (max(0, lo[0]), max(75, lo[1]), min(VIEWPORT[0], hi[0]), min(820, hi[1]))
 
         raw_bars = detect_troop_health_bars(frame, pre_aligned, roi)
         heroes = [b for b in raw_bars if has_level_badge(frame, b[:4])]
-        troops = []
+        all_troops = []
         for x, y, w, h, cname in raw_bars:
             if any(abs(x - hb[0]) <= 28 and abs(y - hb[1]) <= 11 for hb in heroes):
                 continue
             pt = np.array([x + w / 2.0, y + h + 12.0])
-            # Strictly anchor main-army bars to Warden's aura (~150px) so Siege Barracks Wizards on the flank can't hijack!
-            if warden_active and np.linalg.norm(pt - warden_pos) > 165:
-                continue
-            troops.append((pt, cname))
+            all_troops.append((pt, cname))
+
+        # Track whether Warden's detected aura actually has any friendly bars nearby (detects hijacked Warden!)
+        if warden_active:
+            has_bar_near_warden = any(
+                np.linalg.norm(p - warden_pos) <= 185.0 for p, _ in all_troops
+            ) or any(
+                np.linalg.norm(np.array([hb[0] + hb[2] / 2.0, hb[1] + hb[3] + 12.0]) - warden_pos) <= 185.0
+                for hb in heroes
+            )
+            if has_bar_near_warden:
+                self.warden_empty_since = None
+            elif self.warden_empty_since is None:
+                self.warden_empty_since = now
+        else:
+            self.warden_empty_since = None
+        warden_starved = (
+            warden_active
+            and self.warden_empty_since is not None
+            and (now - self.warden_empty_since) >= 1.5
+        )
 
         source = None
         selected_bars = []
-        if troops:
-            pts = [p for p, _ in troops]
-            clusters = self._cluster_bars(pts, max_dist=78.0)
+        if all_troops:
+            pts = [p for p, _ in all_troops]
+            clusters = self._cluster_bars(pts, max_dist=84.0)
             best_score, best_comp = -1e9, None
             for comp in clusters:
                 c_pts = np.asarray([pts[i] for i in comp])
                 c_center = c_pts.mean(axis=0)
                 d_army = float(np.linalg.norm(c_center - army_pred))
                 d_warden = float(np.linalg.norm(c_center - warden_pos)) if warden_active else 0.0
-                if len(comp) == 1 and (d_army > 110 or (warden_active and d_warden > 150)):
+                # Filter isolated 1-2 bar flank noise (e.g. Siege Wizards) when Warden is healthy & non-starved,
+                # but NEVER throw away a real main-army cluster of >=3 troop bars!
+                if len(comp) == 1 and (d_army > 110 or (warden_active and not warden_starved and d_warden > 155)):
                     continue
-                if warden_active and d_warden > 155:
+                if len(comp) == 2 and warden_active and not warden_starved and d_warden > 175 and d_army > 140:
                     continue
-                score = 26.0 * min(len(comp), 5) - 0.55 * d_army - 0.45 * d_warden
+                w_pen = 0.0 if warden_starved else (0.40 * d_warden)
+                a_pen = 0.20 * d_army if (bar_gap >= 1.5 and len(comp) >= 3) else 0.50 * d_army
+                score = 30.0 * min(len(comp), 6) - a_pen - w_pen
                 if score > best_score:
                     best_score, best_comp = score, comp
             if best_comp is not None:
@@ -324,9 +391,15 @@ class HealingWaveTracker:
                 self.army_kf.update(c_center, sigma=sigma, max_speed=95.0)
                 self.army_bar_seen = now
                 self.army_radius = 0.7 * self.army_radius + 0.3 * float(np.clip(spread + 20.0, 28.0, 75.0))
-                selected_bars = [troops[i] for i in best_comp]
+                selected_bars = [all_troops[i] for i in best_comp]
                 source = "health_bars" if len(best_comp) >= 2 else "single_bar"
-                if warden_active:
+                # Self-heal hijacked Warden: if >=3 troop bars appear far from a starved Warden, re-center Warden!
+                if warden_starved and len(best_comp) >= 3 and np.linalg.norm(c_center - warden_pos) > 185.0:
+                    self.warden_kf = _Kalman2D(c_center, pos_std=35.0, vel_std=35.0, damping=1.0)
+                    self.warden_seen = None
+                    self.warden_empty_since = None
+                    warden_pos, warden_active = None, False
+                elif warden_active:
                     new_off = self.army_kf.state[:2] - warden_pos
                     nrm = np.linalg.norm(new_off)
                     if nrm > 155.0:
@@ -334,16 +407,33 @@ class HealingWaveTracker:
                     self.offset = 0.72 * self.offset + 0.28 * new_off
 
         if source is None:
-            m_pos = self._motion_centroid(fr_small, pre_small, warden_pos, warden_active, army_pred)
-            if m_pos is not None and np.linalg.norm(m_pos - army_pred) <= 135:
-                self.army_kf.update(m_pos, sigma=26.0, max_speed=85.0)
+            # Prefer reliable Warden aura anchor over noisy raw motion; tighten motion step (<=60px) and damping
+            # so explosions/star-banners/flank Giants can NEVER cause runaway drift!
+            m_pos = self._motion_centroid(fr_small, pre_small, warden_pos, warden_active and not warden_starved, army_pred)
+            motion_ok = (
+                m_pos is not None
+                and np.linalg.norm(m_pos - army_pred) <= 60.0
+                and (not warden_active or warden_starved or np.linalg.norm(m_pos - warden_pos) <= 145.0)
+            )
+            if warden_active and not warden_starved and self.warden_psr >= 5.8:
+                if motion_ok:
+                    fused = 0.55 * (warden_pos + self.offset) + 0.45 * m_pos
+                    self.army_kf.update(fused, sigma=34.0, max_speed=55.0)
+                    self.army_motion_seen = now
+                    source = "warden_anchor"
+                else:
+                    self.army_kf.update(warden_pos + self.offset, sigma=30.0, max_speed=55.0)
+                    self.offset *= 0.96
+                    source = "warden_anchor"
+            elif motion_ok:
+                self.army_kf.update(m_pos, sigma=44.0, max_speed=45.0)
                 self.army_motion_seen = now
                 source = "motion_only"
-            elif warden_active:
-                self.army_kf.update(warden_pos + self.offset, sigma=28.0, max_speed=70.0)
+            elif warden_active and not warden_starved:
+                self.army_kf.update(warden_pos + self.offset, sigma=32.0, max_speed=55.0)
                 self.offset *= 0.96
                 source = "warden_anchor"
-            elif self.army_bar_seen is not None and (now - self.army_bar_seen) <= 2.5:
+            elif self.army_bar_seen is not None and bar_gap <= 2.5:
                 source = "predicted"
 
         self.prev_small = fr_small
