@@ -136,6 +136,8 @@ class HealingWaveTracker:
             gw_pts = next((c["points"] for c in commands if c["unit"] == "grand_warden" and c.get("points")), None)
             warden_seed = (np.median(gw_pts, axis=0) * [VIEWPORT[0] / 1800, VIEWPORT[1] / 1440]
                            if gw_pts else seed.copy())
+            self.warden_seed = warden_seed.copy()
+            self.army_seed = seed.copy()
             self.warden_kf = _Kalman2D(warden_seed, pos_std=20.0, vel_std=35.0, damping=1.0)
             self.warden_seen = None
             self.warden_psr = 0.0
@@ -185,6 +187,13 @@ class HealingWaveTracker:
         cx_full = (rx_g + tw // 2) * 2.0
         cy_full = (ry_g + th // 2) * 2.0
         in_diamond = (np.abs(cx_full - 600.0) / 520.0 + np.abs(cy_full - 445.0) / 365.0) <= 1.05
+        # Physics reachability bound from Warden's spawn point during opening 12s (Warden walks ~35px/s):
+        # guarantees a distant funnel/Freeze/rubble ring in the base center can NEVER steal initial Warden lock!
+        elapsed_dep = max(0.0, now - self.deployed_at)
+        if elapsed_dep < 12.0:
+            max_from_spawn = 95.0 + 48.0 * elapsed_dep
+            dist_spawn = np.hypot(cx_full - self.warden_seed[0], cy_full - self.warden_seed[1])
+            in_diamond = in_diamond & (dist_spawn <= max_from_spawn)
         valid_vals = res[in_diamond]
         mean_v = float(valid_vals.mean()) if valid_vals.size else float(res.mean())
         std_v = (float(valid_vals.std()) if valid_vals.size else float(res.std())) + 1e-6
@@ -318,19 +327,22 @@ class HealingWaveTracker:
             warden_pos, warden_active = None, False
 
         army_pred = self.army_kf.predict(now, q_pos=14.0, q_vel=45.0)
-        bar_gap = (now - self.army_bar_seen) if self.army_bar_seen is not None else (now - self.deployed_at)
+        elapsed_dep = max(0.0, now - self.deployed_at)
+        bar_gap = (now - self.army_bar_seen) if self.army_bar_seen is not None else elapsed_dep
         if warden_active and self.army_bar_seen is not None and bar_gap > 0.35:
             army_pred = 0.65 * army_pred + 0.35 * (warden_pos + self.offset)
 
-        # If bars haven't been seen for >=1.2s, expand to a full-battlefield bar scan so a drifted/hijacked
-        # Warden or fast army jump can NEVER blind us to a real cluster of green troop health bars!
-        if bar_gap >= 1.2:
+        # Only expand to full-battlefield bar scan AFTER the main army has actually been locked at least once
+        # and lost bars for >=2.0s (NEVER during opening 0..6s while funnel troops across the map are dying!).
+        if self.army_bar_seen is not None and elapsed_dep >= 6.0 and bar_gap >= 2.0:
             roi = (60, 75, VIEWPORT[0] - 60, 820)
         else:
             anchors = [army_pred]
             if warden_active:
                 anchors.append(warden_pos)
-            rad_roi = 225 if warden_active else min(280, 165 + 40 * max(0.0, bar_gap))
+            # Keep opening ROI tight around deployment line so distant funnel troops (Queen/Siege) cannot hijack!
+            rad_roi = (195 if elapsed_dep < 6.0
+                       else (225 if warden_active else min(270, 175 + 35 * max(0.0, bar_gap))))
             lo = np.rint(np.min(anchors, axis=0) - rad_roi).astype(int)
             hi = np.rint(np.max(anchors, axis=0) + rad_roi).astype(int)
             roi = (max(0, lo[0]), max(75, lo[1]), min(VIEWPORT[0], hi[0]), min(820, hi[1]))
@@ -375,6 +387,12 @@ class HealingWaveTracker:
                 c_center = c_pts.mean(axis=0)
                 d_army = float(np.linalg.norm(c_center - army_pred))
                 d_warden = float(np.linalg.norm(c_center - warden_pos)) if warden_active else 0.0
+                # Physics reachability gate during opening 8s: never jump onto funnel troops across the map!
+                if elapsed_dep < 8.0 and np.linalg.norm(c_center - self.army_seed) > (130.0 + 55.0 * elapsed_dep):
+                    continue
+                # Even during full-battlefield reacquire, cap teleport jump so distant cleanup/funnel clusters can't hijack
+                if d_army > min(280.0, 145.0 + 45.0 * bar_gap):
+                    continue
                 # Filter isolated 1-2 bar flank noise (e.g. Siege Wizards) when Warden is healthy & non-starved,
                 # but NEVER throw away a real main-army cluster of >=3 troop bars!
                 if len(comp) == 1 and (d_army > 110 or (warden_active and not warden_starved and d_warden > 155)):
@@ -396,8 +414,8 @@ class HealingWaveTracker:
                 self.army_radius = 0.7 * self.army_radius + 0.3 * float(np.clip(spread + 20.0, 28.0, 75.0))
                 selected_bars = [all_troops[i] for i in best_comp]
                 source = "health_bars" if len(best_comp) >= 2 else "single_bar"
-                # Self-heal hijacked Warden: if >=3 troop bars appear far from a starved Warden, re-center Warden!
-                if warden_starved and len(best_comp) >= 3 and np.linalg.norm(c_center - warden_pos) > 185.0:
+                # Self-heal hijacked Warden: only after opening 6s, if >=3 troop bars appear far from a starved Warden
+                if elapsed_dep >= 6.0 and warden_starved and len(best_comp) >= 3 and np.linalg.norm(c_center - warden_pos) > 185.0:
                     self.warden_kf = _Kalman2D(c_center, pos_std=35.0, vel_std=35.0, damping=1.0)
                     self.warden_seen = None
                     self.warden_empty_since = None

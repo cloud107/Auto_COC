@@ -513,7 +513,8 @@ def run_stage1(adb, args):
                 sample = next(frames)
                 if sample.timestamp >= started and sample.phase == "battle":
                     tr, _ = camera.align(sample.frame)
-                    tracker.observe(sample.frame, sample.timestamp, transform=tr)
+                    # Do NOT search for Grand Warden before dispatch_main() has finished placing him!
+                    tracker.observe(sample.frame, sample.timestamp, transform=tr, warden_alive=False)
                     if video_recorder is not None:
                         video_recorder.write_banner_frame(
                             sample.frame,
