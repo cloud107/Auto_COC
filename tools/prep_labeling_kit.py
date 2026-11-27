@@ -9,9 +9,12 @@ classes.txt + data.yaml with fine-grained non-defense classes and the 6 Hero Fla
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 from collections import Counter
 from pathlib import Path
+
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -76,6 +79,46 @@ NEW_CLASSES = [
 ALL_CLASSES = EXISTING_24_CLASSES + NEW_CLASSES
 
 
+def _write_xanylabeling_json(img_path: Path, lbl_path: Path, json_path: Path, class_names: list[str]) -> int:
+    with Image.open(img_path) as im:
+        iw, ih = im.size
+    shapes = []
+    if lbl_path.exists():
+        for line in lbl_path.read_text(encoding="utf-8").splitlines():
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            cid = int(parts[0])
+            cx, cy, bw, bh = map(float, parts[1:5])
+            x1 = round((cx - bw / 2.0) * iw, 2)
+            y1 = round((cy - bh / 2.0) * ih, 2)
+            x2 = round((cx + bw / 2.0) * iw, 2)
+            y2 = round((cy + bh / 2.0) * ih, 2)
+            label = class_names[cid] if 0 <= cid < len(class_names) else str(cid)
+            shapes.append({
+                "label": label,
+                "score": None,
+                "points": [[x1, y1], [x2, y2]],
+                "group_id": None,
+                "description": "",
+                "difficult": False,
+                "shape_type": "rectangle",
+                "flags": {},
+                "attributes": {},
+            })
+    payload = {
+        "version": "2.4.4",
+        "flags": {},
+        "shapes": shapes,
+        "imagePath": img_path.name,
+        "imageData": None,
+        "imageHeight": ih,
+        "imageWidth": iw,
+    }
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return len(shapes)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -100,6 +143,7 @@ def main():
 
     counts = Counter()
     copied = 0
+    json_boxes = 0
     for split in ("train", "val", "test"):
         img_src = args.src / "images" / split
         lbl_src = args.src / "labels" / split
@@ -110,22 +154,29 @@ def main():
         img_dst.mkdir(parents=True, exist_ok=True)
         lbl_dst.mkdir(parents=True, exist_ok=True)
         for img_path in sorted(img_src.glob("*.*")):
-            shutil.copy2(img_path, img_dst / img_path.name)
+            if img_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
+                continue
+            dst_img = img_dst / img_path.name
+            shutil.copy2(img_path, dst_img)
             lbl_path = lbl_src / f"{img_path.stem}.txt"
+            dst_lbl = lbl_dst / f"{img_path.stem}.txt"
             if lbl_path.exists():
-                shutil.copy2(lbl_path, lbl_dst / lbl_path.name)
+                shutil.copy2(lbl_path, dst_lbl)
                 for line in lbl_path.read_text(encoding="utf-8").splitlines():
                     if line.strip():
                         counts[int(line.split()[0])] += 1
+            # Write X-AnyLabeling native .json right next to each image for zero-config Open Dir!
+            json_boxes += _write_xanylabeling_json(dst_img, dst_lbl, img_dst / f"{img_path.stem}.json", ALL_CLASSES)
             copied += 1
 
-    # Write classes.txt (LabelImg / X-AnyLabeling compatible) inside root and each labels/<split>
+    # Write classes.txt in root, labels/<split>, and images/<split> (X-AnyLabeling predefined classes)
     classes_txt = "\n".join(ALL_CLASSES) + "\n"
     (args.dst / "classes.txt").write_text(classes_txt, encoding="utf-8")
     for split in ("train", "val", "test"):
-        d = args.dst / "labels" / split
-        if d.exists():
-            (d / "classes.txt").write_text(classes_txt, encoding="utf-8")
+        for sub in ("labels", "images"):
+            d = args.dst / sub / split
+            if d.exists():
+                (d / "classes.txt").write_text(classes_txt, encoding="utf-8")
 
     # Write YOLO data.yaml
     yaml_lines = [
@@ -137,15 +188,15 @@ def main():
         *[f"  {i}: {name}" for i, name in enumerate(ALL_CLASSES)],
         "",
     ]
-    (args.dst / "data.yaml").write_text("\n".join(yaml_lines), encoding="utf-8")
+    (args.dst / "data.yaml").write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
 
-    print(f"Prepared incremental labeling kit at {args.dst}")
-    print(f"Copied {copied} images + existing 24-class labels ({sum(counts.values())} preserved boxes).")
+    print(f"Prepared X-AnyLabeling + YOLO incremental workspace at {args.dst}")
+    print(f"Copied {copied} images + {json_boxes} preserved defense boxes into native X-AnyLabeling .json files.")
     print("Classes needing boost (count < 30 among existing 24):")
     for cid in range(len(EXISTING_24_CLASSES)):
         if counts[cid] < 30:
             print(f"  {cid:2d}: {EXISTING_24_CLASSES[cid]:25s} ({counts[cid]} boxes)")
-    print(f"Ready to add {len(NEW_CLASSES)} new classes (IDs 24..{len(ALL_CLASSES)-1}) in classes.txt!")
+    print(f"Ready to add {len(NEW_CLASSES)} new classes (IDs 24..{len(ALL_CLASSES)-1}) via classes.txt!")
 
 
 if __name__ == "__main__":
