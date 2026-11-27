@@ -551,10 +551,12 @@ def run_stage1(adb, args):
 
             tr, gray = camera.align(frame)
             elapsed_main = ts - started
-            warden_alive = True if elapsed_main < 3.0 else hero_is_alive(img, SLOTS["grand_warden"])
+            warden_hud_hp = 1.0 if elapsed_main < 3.0 else hero_hp_fraction(img, SLOTS["grand_warden"])
+            rc_hud_hp = 1.0 if elapsed_main < 3.0 else hero_hp_fraction(img, SLOTS["royal_champion"])
+            warden_alive = warden_hud_hp > 0.0
             if not warden_alive and hero_states[2] == 1:
                 hero_states[2] = 2
-            if elapsed_main >= 3.0 and not hero_is_alive(img, SLOTS["royal_champion"]) and hero_states[3] == 1:
+            if elapsed_main >= 3.0 and rc_hud_hp <= 0.0 and hero_states[3] == 1:
                 hero_states[3] = 2
             groups = tracker.observe(frame, ts, transform=tr, warden_alive=warden_alive)
 
@@ -649,7 +651,7 @@ def run_stage1(adb, args):
                         revive_attempts = 0
 
             # Revive Spell: reserve strictly for Dragon Duke (once red-flash stops for >=2.5s = true KO);
-            # only spend on fallen RC/Queen late in cleanup when Dragon Duke is clearly safe (>=75% cleared & >=45s).
+            # in endgame, if Dragon Duke is safe, spend Revive on ANY fallen hero (RC -> Queen -> Warden) to maximize value!
             fallen_target = None
             if (
                 args.enable_revive
@@ -663,12 +665,20 @@ def run_stage1(adb, args):
                     alive_defs = sum(1 for b in encoder.buildings if b.alive)
                     total_defs = max(1, len(encoder.buildings))
                     cleared_frac = 1.0 - (alive_defs / total_defs)
-                    dragon_safe = dragon_still_alive and elapsed_main >= 45.0 and (cleared_frac >= 0.75 or alive_defs <= 4)
-                    if dragon_safe:
-                        if not hero_is_alive(img, SLOTS["royal_champion"]):
+                    endgame_revive = (
+                        dragon_still_alive
+                        and (
+                            (elapsed_main >= 35.0 and (cleared_frac >= 0.72 or alive_defs <= 5))
+                            or elapsed_main >= 65.0
+                        )
+                    )
+                    if endgame_revive:
+                        if rc_hud_hp <= 0.0:
                             fallen_target = SLOTS["royal_champion"]
                         elif not hero_is_alive(img, SLOTS["archer_queen"]):
                             fallen_target = SLOTS["archer_queen"]
+                        elif not warden_alive:
+                            fallen_target = SLOTS["grand_warden"]
 
             state = encoder.encode(
                 elapsed_main,
@@ -679,10 +689,16 @@ def run_stage1(adb, args):
                 card_counts=card_counts,
                 hero_states=hero_states,
             )
+            hero_hps = {
+                SLOTS["dragon_duke"]: dragon_hud_hp_main,
+                SLOTS["grand_warden"]: warden_hud_hp,
+                SLOTS["royal_champion"]: rc_hud_hp,
+            }
             act = fsm.step(
                 state, card_counts, hero_states, groups,
                 enemy_hero_tiles=enemy_tiles, fallen_hero_tile=fallen_target,
                 live_guardian_tile=live_guardian_tile, guardian_awake=guardian_awake,
+                hero_hps=hero_hps,
             )
             if recorder is not None:
                 recorder.add(state, act)

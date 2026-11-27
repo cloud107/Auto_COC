@@ -254,10 +254,13 @@ class PotentialFieldFSM:
     funnel_started_at: float | None = field(default=None, init=False)
     main_pushed_at: float | None = field(default=None, init=False)
     warden_tome_end: float = field(default=-1.0, init=False)
+    rc_ability_end: float = field(default=-1.0, init=False)
     last_heal_at: float = field(default=-99.0, init=False)
+    last_endgame_dump_at: float = field(default=-99.0, init=False)
     active_spells: list[dict] = field(default_factory=list, init=False)
     yellow_seen_at: float | None = field(default=None, init=False)
     bar_history: list[tuple[float, int]] = field(default_factory=list, init=False)
+    hero_hp_history: dict[int, list[tuple[float, float]]] = field(default_factory=dict, init=False)
     pending_queue: list[tuple[int, tuple[int, int], str]] = field(default_factory=list, init=False)
 
     def _enqueue_opening(self, spatial: np.ndarray, now: float):
@@ -297,6 +300,16 @@ class PotentialFieldFSM:
                 "radius": 3.5, "duration": 5.5, "end": now + 5.5,
             })
 
+    def _update_hero_hp_drop(self, now: float, slot: int, hp: float | None) -> tuple[float | None, float]:
+        """Track rolling 1.6s HUD HP history for a hero and return (current_hp, recent_drop)."""
+        if hp is None or hp <= 0.0:
+            return None, 0.0
+        hist = self.hero_hp_history.setdefault(slot, [])
+        hist.append((now, hp))
+        hist[:] = [(ts, val) for ts, val in hist if now - ts <= 1.6]
+        peak = max((val for _, val in hist), default=hp)
+        return hp, max(0.0, peak - hp)
+
     def step(
         self,
         state: dict,
@@ -307,6 +320,7 @@ class PotentialFieldFSM:
         fallen_hero_tile: np.ndarray | None = None,
         live_guardian_tile: np.ndarray | None = None,
         guardian_awake: bool = False,
+        hero_hps: dict[int, float] | None = None,
     ) -> FactorizedAction:
         now = state["time"]
         spatial = state["spatial"]
@@ -342,7 +356,13 @@ class PotentialFieldFSM:
 
         # State 3 & 4: CLOSED_LOOP_MICRO -> CLEANUP
         destruction = float(state["global"][1])
-        if self.enable_cleanup and destruction >= 0.70 and card_counts.get(SLOTS["archer"], 0) > 0:
+        alive_defs = state.get("alive_buildings", [])
+        is_endgame = (
+            (now >= 30.0 and len(alive_defs) <= 5)
+            or (now >= 35.0 and destruction >= 0.72)
+            or (now >= 65.0)
+        )
+        if self.enable_cleanup and (destruction >= 0.70 or is_endgame) and card_counts.get(SLOTS["archer"], 0) > 0:
             self.phase = "CLEANUP"
 
         army_tile = state.get("army_tile")
@@ -351,10 +371,16 @@ class PotentialFieldFSM:
         bars = primary.get("bars", []) if primary else []
         yellow_cnt = sum(1 for b in bars if b.get("yellow"))
 
-        # Track short-term bar count history (0.7s window) for sudden burst damage detection
+        # Track short-term bar count history (0.7s window) and hero HUD HP drops (1.6s window)
         if primary and primary.get("source") == "health_bars":
             self.bar_history.append((now, len(bars)))
         self.bar_history = [(ts, cnt) for ts, cnt in self.bar_history if now - ts <= 0.7]
+        warden_hp, warden_hp_drop = self._update_hero_hp_drop(
+            now, SLOTS["grand_warden"], (hero_hps or {}).get(SLOTS["grand_warden"])
+        )
+        rc_hp, rc_hp_drop = self._update_hero_hp_drop(
+            now, SLOTS["royal_champion"], (hero_hps or {}).get(SLOTS["royal_champion"])
+        )
 
         # Locate the Guardian accurately using continuous shrine-seeded badge tracking (only while alive!)
         guardian = state.get("guardian")
@@ -409,20 +435,27 @@ class PotentialFieldFSM:
                     totem_slot, (gx, gy), "spell", totem_reason, self.phase, slot_mask, gmask
                 )
 
-        # --- 1b. Royal Champion Ability (trigger when surrounded by heavy core fire) ---
+        # --- 1b. Royal Champion Ability (staggered with Warden Tome; freezes nearby defenses for ~7s) ---
         rc_slot = SLOTS["royal_champion"]
+        tome_active = now < self.warden_tome_end
+        rc_low_or_dropping = (rc_hp is not None) and ((rc_hp <= 0.42) or (rc_hp_drop >= 0.20))
         if self.enable_rc_ability and hero_states[3] == 1 and army_tile is not None and now >= 8.0:
             gx = int(np.clip(round(army_tile[0]), 0, GRID_SIZE - 1))
             gy = int(np.clip(round(army_tile[1]), 0, GRID_SIZE - 1))
             core_threat = float(spatial[1, gy, gx])
             nearby_core = sum(
-                1 for b in state.get("alive_buildings", [])
+                1 for b in alive_defs
                 if b.is_core and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 8.0
             )
-            if core_threat >= 1.0 or nearby_core >= 2:
-                return FactorizedAction(rc_slot, None, "hero_ability", "rc_heavy_fire", self.phase, slot_mask, None)
+            # Defer RC ability while Warden Eternal Tome is active unless RC herself is losing HP outside the aura
+            if (not tome_active and (core_threat >= 1.0 or nearby_core >= 2 or rc_low_or_dropping)) or (
+                tome_active and rc_low_or_dropping
+            ):
+                self.rc_ability_end = now + 7.0
+                reason = "rc_low_hp_save" if rc_low_or_dropping else "rc_heavy_fire"
+                return FactorizedAction(rc_slot, None, "hero_ability", reason, self.phase, slot_mask, None)
 
-        # --- 2. Grand Warden Eternal Tome (ONLY when Warden actually covers the main army in the core!) ---
+        # --- 2. Grand Warden Eternal Tome (ONLY when Warden covers main army; staggered after RC freeze!) ---
         warden_slot = SLOTS["grand_warden"]
         warden_tile = state.get("warden_tile")
         pushed_deep = True
@@ -456,15 +489,29 @@ class PotentialFieldFSM:
                 )
             peak_bars = max((cnt for _, cnt in self.bar_history), default=0)
             sharp_drop = peak_bars >= 4 and len(bars) > 0 and len(bars) <= peak_bars * 0.65
-            if (
+            army_hp_dropping = (
+                sharp_drop
+                or (yellow_cnt >= 2 and (yellow_cnt / max(1, len(bars))) >= 0.35)
+                or ((warden_hp is not None) and (warden_hp <= 0.48 or warden_hp_drop >= 0.16))
+            )
+            rc_freeze_active = now < self.rc_ability_end
+            if rc_freeze_active:
+                # Defenses are already frozen by RC: hold Eternal Tome UNLESS main army / Warden is still losing HP!
+                if army_hp_dropping:
+                    self.warden_tome_end = now + 7.5
+                    return FactorizedAction(
+                        warden_slot, None, "hero_ability", "override_rc_freeze_hp_drop", self.phase, slot_mask, None
+                    )
+            elif (
                 (guardian_near and (yellow_cnt >= 1 or sharp_drop or len(bars) >= 3))
                 or (core_threat >= 0.90 and (sharp_drop or yellow_cnt >= 2 or (now >= 18.0 and len(bars) >= 2)))
                 or (now >= 26.0 and len(bars) >= 2)
+                or army_hp_dropping
             ):
                 self.warden_tome_end = now + 7.5
                 if guardian_near:
                     reason = f"guardian_{guardian.name}" if guardian is not None else "guardian_engagement"
-                elif sharp_drop:
+                elif sharp_drop or army_hp_dropping:
                     reason = "burst_bar_drop"
                 elif core_threat >= 0.90:
                     reason = "core_heavy_fire"
@@ -589,6 +636,29 @@ class PotentialFieldFSM:
                     freeze_slot, (gx, gy), "spell", f"freeze_{best_target.name}", self.phase, slot_mask, gmask
                 )
 
+        # --- 3c. Poison Spell on Guardian or defending enemy heroes engaging the army ---
+        poison_slot = SLOTS["poison_spell"]
+        if slot_mask[poison_slot] and army_tile is not None and now >= 4.0:
+            poison_target = None
+            poison_reason = None
+            if guardian is not None and guardian_tile is not None:
+                if math.hypot(army_tile[0] - guardian_tile[0], army_tile[1] - guardian_tile[1]) <= 9.5:
+                    poison_target = guardian_tile
+                    poison_reason = f"poison_{guardian.name}"
+            elif enemy_hero_tiles:
+                near_enemy = min(
+                    enemy_hero_tiles,
+                    key=lambda et: math.hypot(army_tile[0] - et[0], army_tile[1] - et[1]),
+                )
+                if math.hypot(army_tile[0] - near_enemy[0], army_tile[1] - near_enemy[1]) <= 8.5:
+                    poison_target = near_enemy
+                    poison_reason = "poison_enemy_hero"
+            if poison_target is not None:
+                gx = int(np.clip(round(poison_target[0]), 0, GRID_SIZE - 1))
+                gy = int(np.clip(round(poison_target[1]), 0, GRID_SIZE - 1))
+                _, gmask = compute_action_masks(card_counts, hero_states, spatial[7], poison_slot)
+                return FactorizedAction(poison_slot, (gx, gy), "spell", poison_reason, self.phase, slot_mask, gmask)
+
         # --- 4. Optional Revive Spell (via HUD hero portrait tap for 100% accuracy, or map tile fallback) ---
         revive_slot = SLOTS["revive_spell"]
         if self.enable_revive and slot_mask[revive_slot] and fallen_hero_tile is not None:
@@ -605,7 +675,7 @@ class PotentialFieldFSM:
 
         # --- 5. Optional Cleanup (includes zero-label non-defense trash buildings!) ---
         if self.phase == "CLEANUP" and slot_mask[SLOTS["archer"]] and army_tile is not None:
-            alive = [*state.get("alive_buildings", []), *state.get("alive_non_defense", [])]
+            alive = [*alive_defs, *state.get("alive_non_defense", [])]
             if alive:
                 farthest = max(alive, key=lambda b: math.hypot(b.tile[0] - army_tile[0], b.tile[1] - army_tile[1]))
                 deploy_rows, deploy_cols = np.where(spatial[7] >= 0.5)
@@ -614,5 +684,127 @@ class PotentialFieldFSM:
                     cell = (int(deploy_cols[idx]), int(deploy_rows[idx]))
                     _, gmask = compute_action_masks(card_counts, hero_states, spatial[7], SLOTS["archer"])
                     return FactorizedAction(SLOTS["archer"], cell, "deploy", "cleanup_farthest", self.phase, slot_mask, gmask)
+
+        # --- 6. Endgame Value Maximization: spend remaining beneficial spells & hero abilities before battle ends ---
+        # Note: Ice Block (slot 14) is intentionally excluded because freezing healthy cleanup troops reduces DPS.
+        if is_endgame and (now - self.last_endgame_dump_at) >= 1.2:
+            # 6a. Leftover Healing Spell on active army approaching remaining defenses (or low-HP cleanup)
+            already_healing_end = army_tile is not None and any(
+                sp["slot"] == heal_slot and math.hypot(army_tile[0] - sp["tile"][0], army_tile[1] - sp["tile"][1]) < (HEAL_RADIUS + 1.5)
+                for sp in self.active_spells
+            )
+            if (
+                slot_mask[heal_slot]
+                and army_tile is not None
+                and now >= self.warden_tome_end
+                and heal_cd >= 4.0
+                and not already_healing_end
+                and (len(alive_defs) >= 1 or yellow_cnt >= 1 or now >= 70.0)
+            ):
+                target_tile = army_tile.copy()
+                if alive_defs:
+                    nearest_d = min(alive_defs, key=lambda b: math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]))
+                    vec = nearest_d.tile - army_tile
+                    dn = float(np.linalg.norm(vec))
+                    if dn > 0.5:
+                        target_tile = np.clip(army_tile + vec * (min(2.0, dn * 0.6) / dn), 0.0, GRID_SIZE - 1.0)
+                gx, gy = int(round(target_tile[0])), int(round(target_tile[1]))
+                _, gmask = compute_action_masks(card_counts, hero_states, spatial[7], heal_slot)
+                self.record_spell(now, heal_slot, (gx, gy))
+                self.last_heal_at = now
+                self.last_endgame_dump_at = now
+                return FactorizedAction(heal_slot, (gx, gy), "spell", "endgame_heal", self.phase, slot_mask, gmask)
+
+            # 6b. Leftover Freeze Spell on any highest-value remaining defense, Guardian, or enemy hero
+            if self.enable_freeze and slot_mask[freeze_slot]:
+                best_tile = None
+                best_label = None
+                best_score = -1e9
+                for b in alive_defs:
+                    if any(
+                        sp["slot"] == freeze_slot and math.hypot(b.tile[0] - sp["tile"][0], b.tile[1] - sp["tile"][1]) < 3.2
+                        for sp in self.active_spells
+                    ):
+                        continue
+                    dist = math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) if army_tile is not None else 0.0
+                    base = FREEZE_PRIORITY_DEFENSES.get(b.name, 1.5 if b.is_core else (1.0 if b.is_splash else 0.6))
+                    sc = base - 0.08 * dist
+                    if sc > best_score:
+                        best_score = sc
+                        best_tile = b.tile
+                        best_label = b.name
+                if best_tile is None and guardian is not None and guardian_tile is not None:
+                    best_tile, best_label = guardian_tile, guardian.name
+                elif best_tile is None and enemy_hero_tiles:
+                    best_tile, best_label = enemy_hero_tiles[0], "enemy_hero"
+                if best_tile is not None:
+                    gx = int(np.clip(round(best_tile[0]), 0, GRID_SIZE - 1))
+                    gy = int(np.clip(round(best_tile[1]), 0, GRID_SIZE - 1))
+                    _, gmask = compute_action_masks(card_counts, hero_states, spatial[7], freeze_slot)
+                    self.record_spell(now, freeze_slot, (gx, gy))
+                    self.last_endgame_dump_at = now
+                    return FactorizedAction(
+                        freeze_slot, (gx, gy), "spell", f"endgame_freeze_{best_label}", self.phase, slot_mask, gmask
+                    )
+
+            # 6c. Leftover Totem Spell to tank/distract remaining defense, Guardian, or nearest building
+            if self.enable_totem and slot_mask[totem_slot]:
+                totem_pt = None
+                totem_lbl = None
+                if guardian is not None and guardian_tile is not None:
+                    totem_pt, totem_lbl = guardian_tile, guardian.name
+                elif alive_defs:
+                    tgt_b = min(
+                        alive_defs,
+                        key=lambda b: (
+                            -(2.0 if b.is_core else (1.0 if b.is_splash else 0.0)),
+                            math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) if army_tile is not None else 0.0,
+                        ),
+                    )
+                    totem_pt, totem_lbl = tgt_b.tile, tgt_b.name
+                elif state.get("alive_non_defense"):
+                    nb = min(
+                        state["alive_non_defense"],
+                        key=lambda b: math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) if army_tile is not None else 0.0,
+                    )
+                    totem_pt, totem_lbl = nb.tile, "cleanup_building"
+                if totem_pt is not None:
+                    gx = int(np.clip(round(totem_pt[0]), 2, GRID_SIZE - 3))
+                    gy = int(np.clip(round(totem_pt[1]), 2, GRID_SIZE - 3))
+                    _, gmask = compute_action_masks(card_counts, hero_states, spatial[7], totem_slot)
+                    self.last_endgame_dump_at = now
+                    return FactorizedAction(
+                        totem_slot, (gx, gy), "spell", f"endgame_totem_{totem_lbl}", self.phase, slot_mask, gmask
+                    )
+
+            # 6d. Leftover Poison Spell on Guardian / enemy hero / army engagement zone
+            if slot_mask[poison_slot]:
+                p_pt = None
+                p_lbl = None
+                if guardian is not None and guardian_tile is not None:
+                    p_pt, p_lbl = guardian_tile, guardian.name
+                elif enemy_hero_tiles:
+                    p_pt, p_lbl = enemy_hero_tiles[0], "enemy_hero"
+                elif army_tile is not None and (len(alive_defs) >= 1 or now >= 65.0):
+                    p_pt, p_lbl = army_tile, "army_zone"
+                if p_pt is not None:
+                    gx = int(np.clip(round(p_pt[0]), 0, GRID_SIZE - 1))
+                    gy = int(np.clip(round(p_pt[1]), 0, GRID_SIZE - 1))
+                    _, gmask = compute_action_masks(card_counts, hero_states, spatial[7], poison_slot)
+                    self.last_endgame_dump_at = now
+                    return FactorizedAction(
+                        poison_slot, (gx, gy), "spell", f"endgame_poison_{p_lbl}", self.phase, slot_mask, gmask
+                    )
+
+            # 6e. Unspent RC / Warden abilities near endgame (still respecting stagger!)
+            if self.enable_rc_ability and hero_states[3] == 1 and now >= self.warden_tome_end and (len(alive_defs) >= 1 or now >= 55.0):
+                self.rc_ability_end = now + 7.0
+                self.last_endgame_dump_at = now
+                return FactorizedAction(rc_slot, None, "hero_ability", "endgame_rc_ability", self.phase, slot_mask, None)
+
+            if self.enable_warden_ability and hero_states[2] == 1 and now >= self.rc_ability_end and (len(alive_defs) >= 1 or now >= 60.0):
+                self.warden_tome_end = now + 7.5
+                self.last_endgame_dump_at = now
+                return FactorizedAction(warden_slot, None, "hero_ability", "endgame_warden_tome", self.phase, slot_mask, None)
 
         return noop("monitoring")
