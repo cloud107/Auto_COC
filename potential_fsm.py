@@ -371,10 +371,23 @@ class PotentialFieldFSM:
         bars = primary.get("bars", []) if primary else []
         yellow_cnt = sum(1 for b in bars if b.get("yellow"))
 
-        # Track short-term bar count history (0.7s window) and hero HUD HP drops (1.6s window)
+        # Track short-term bar count history (0.7s window), sustained yellow HP, and hero HUD HP drops (1.6s window)
         if primary and primary.get("source") == "health_bars":
             self.bar_history.append((now, len(bars)))
         self.bar_history = [(ts, cnt) for ts, cnt in self.bar_history if now - ts <= 0.7]
+        low_hp_now = (
+            primary is not None
+            and primary.get("source") == "health_bars"
+            and len(bars) >= 2
+            and yellow_cnt >= 2
+            and (yellow_cnt / len(bars)) >= 0.35
+        )
+        sustained_low_hp = (
+            low_hp_now
+            and (self.yellow_seen_at is not None)
+            and ((now - self.yellow_seen_at) <= 0.8)
+        )
+        self.yellow_seen_at = now if low_hp_now else None
         warden_hp, warden_hp_drop = self._update_hero_hp_drop(
             now, SLOTS["grand_warden"], (hero_hps or {}).get(SLOTS["grand_warden"])
         )
@@ -489,15 +502,16 @@ class PotentialFieldFSM:
                 )
             peak_bars = max((cnt for _, cnt in self.bar_history), default=0)
             sharp_drop = peak_bars >= 4 and len(bars) > 0 and len(bars) <= peak_bars * 0.65
-            army_hp_dropping = (
-                sharp_drop
-                or (yellow_cnt >= 2 and (yellow_cnt / max(1, len(bars))) >= 0.35)
-                or ((warden_hp is not None) and (warden_hp <= 0.48 or warden_hp_drop >= 0.16))
+            # Real HP-loss override during RC's 7s freeze: NEVER trigger on bar-count dip alone (Miners burrow
+            # underground and healed troops hide full-HP bars!). Require sustained yellow/red troop damage OR Warden HP drop!
+            real_hp_dropping = (
+                (sustained_low_hp and yellow_cnt >= 3 and (yellow_cnt / max(1, len(bars))) >= 0.45)
+                or ((warden_hp is not None) and (warden_hp <= 0.45 or warden_hp_drop >= 0.22))
             )
             rc_freeze_active = now < self.rc_ability_end
             if rc_freeze_active:
-                # Defenses are already frozen by RC: hold Eternal Tome UNLESS main army / Warden is still losing HP!
-                if army_hp_dropping:
+                # Defenses are already frozen by RC: hold Eternal Tome UNLESS army/Warden is genuinely losing HP!
+                if real_hp_dropping:
                     self.warden_tome_end = now + 7.5
                     return FactorizedAction(
                         warden_slot, None, "hero_ability", "override_rc_freeze_hp_drop", self.phase, slot_mask, None
@@ -506,12 +520,12 @@ class PotentialFieldFSM:
                 (guardian_near and (yellow_cnt >= 1 or sharp_drop or len(bars) >= 3))
                 or (core_threat >= 0.90 and (sharp_drop or yellow_cnt >= 2 or (now >= 18.0 and len(bars) >= 2)))
                 or (now >= 26.0 and len(bars) >= 2)
-                or army_hp_dropping
+                or real_hp_dropping
             ):
                 self.warden_tome_end = now + 7.5
                 if guardian_near:
                     reason = f"guardian_{guardian.name}" if guardian is not None else "guardian_engagement"
-                elif sharp_drop or army_hp_dropping:
+                elif sharp_drop or real_hp_dropping:
                     reason = "burst_bar_drop"
                 elif core_threat >= 0.90:
                     reason = "core_heavy_fire"
@@ -519,7 +533,7 @@ class PotentialFieldFSM:
                     reason = "core_timely_tome"
                 return FactorizedAction(warden_slot, None, "hero_ability", reason, self.phase, slot_mask, None)
 
-        # --- 3. Closed-loop Healing Spell (additive splash-threat score + yellow-HP check; no hard timers) ---
+        # --- 3. Closed-loop Healing Spell (unfrozen splash-threat + real damage check; tight lead on army!) ---
         heal_slot = SLOTS["healing_spell"]
         heal_cd = now - self.last_heal_at
         if (
@@ -530,9 +544,19 @@ class PotentialFieldFSM:
             and heal_cd >= 3.5
         ):
             if primary.get("source") == "health_bars" and len(bars) >= 2:
-                alive = state.get("alive_buildings", [])
+                alive = alive_defs
+                freeze_slot_id = SLOTS["freeze_spell"]
+                # Exclude defenses currently frozen by an active Freeze Spell from splash_score!
+                unfrozen_alive = [
+                    b for b in alive
+                    if not any(
+                        sp["slot"] == freeze_slot_id
+                        and math.hypot(b.tile[0] - sp["tile"][0], b.tile[1] - sp["tile"][1]) <= 3.6
+                        for sp in self.active_spells
+                    )
+                ]
                 splash_score = 0.0
-                for b in alive:
+                for b in unfrozen_alive:
                     w = HEAL_SPLASH_WEIGHTS.get(b.name, 0.0)
                     if w <= 0.0:
                         continue
@@ -540,29 +564,26 @@ class PotentialFieldFSM:
                     if b.covers_tile(army_tile, max_range=max_r, margin=0.3):
                         splash_score += w
 
-                low_hp = yellow_cnt >= 2 and (yellow_cnt / len(bars)) >= 0.35
-                # Count alive defenses within 6.5 tiles so we NEVER drop Heal in an empty transit zone troops run right past!
+                # Count unfrozen alive defenses within 6.0 tiles so we NEVER drop Heal in an empty transit zone!
                 nearby_defs = [
-                    b for b in alive
-                    if math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 6.5
+                    b for b in unfrozen_alive
+                    if math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 6.0
                 ]
-                has_stay_pocket = len(nearby_defs) >= 2 or splash_score >= 2.0
+                has_stay_pocket = len(nearby_defs) >= 2 or splash_score >= 2.2
                 hp_trigger = (
-                    low_hp
-                    and (self.yellow_seen_at is not None)
-                    and ((now - self.yellow_seen_at) <= 0.8)
+                    sustained_low_hp
                     and has_stay_pocket
                     and (splash_score >= 1.5 or yellow_cnt >= 3)
                 )
-                self.yellow_seen_at = now if low_hp else None
 
-                # Lead Heal toward the weighted centroid of the upcoming defense pocket (not an isolated perimeter building!)
+                # Keep Heal tightly anchored ON / just ahead of the army (<=1.6 tiles) toward nearby defenses (<=5.5t)
+                # so the main army is ALWAYS well inside the Heal circle and never left outside an empty corner!
                 lead = np.zeros(2, dtype=float)
-                max_lead = 2.6 if hp_trigger else 3.0
-                lead_frac = 0.72 if hp_trigger else 0.82
+                max_lead = 1.5 if hp_trigger else 1.7
+                lead_frac = 0.50 if hp_trigger else 0.58
                 pocket = [
                     b for b in alive
-                    if math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 8.0
+                    if math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 5.5
                 ]
                 if pocket:
                     weights = np.array([
@@ -575,19 +596,9 @@ class PotentialFieldFSM:
                     d_next = float(np.linalg.norm(vec))
                     if d_next > 0.5:
                         lead = vec * (min(max_lead, d_next * lead_frac) / d_next)
-                elif alive:
-                    next_def = min(
-                        alive,
-                        key=lambda b: math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]),
-                    )
-                    vec = next_def.tile - army_tile
-                    d_next = float(np.linalg.norm(vec))
-                    if d_next > 0.5:
-                        lead = vec * (min(max_lead, d_next * lead_frac) / d_next)
-                else:
+                elif float(np.linalg.norm(army_vel)) > 0.3:
                     speed = float(np.linalg.norm(army_vel))
-                    if speed > 0.3:
-                        lead = army_vel * min(1.5, max_lead / max(speed, 1e-3))
+                    lead = army_vel * min(1.2, max_lead / max(speed, 1e-3))
                 target_tile = np.clip(army_tile + lead, 0.0, GRID_SIZE - 1.0)
                 gx, gy = int(round(target_tile[0])), int(round(target_tile[1]))
 
@@ -595,7 +606,19 @@ class PotentialFieldFSM:
                     sp["slot"] == heal_slot and math.hypot(army_tile[0] - sp["tile"][0], army_tile[1] - sp["tile"][1]) < (HEAL_RADIUS + 1.5)
                     for sp in self.active_spells
                 )
-                in_splash = heal_cd >= 6.5 and len(bars) >= 3 and splash_score >= 3.2 and has_stay_pocket
+                # Never waste a preemptive Heal on 100% healthy full-green troops (especially during RC freeze!):
+                # require at least 1 damaged/yellow troop OR genuinely extreme unfrozen multi-splash deep in the core.
+                rc_freeze_now = now < self.rc_ability_end
+                in_splash = (
+                    not rc_freeze_now
+                    and heal_cd >= 6.5
+                    and len(bars) >= 3
+                    and has_stay_pocket
+                    and (
+                        (splash_score >= 3.6 and yellow_cnt >= 1)
+                        or (splash_score >= 4.8 and pushed_deep and len(bars) >= 4)
+                    )
+                )
                 if not already_healing and (hp_trigger or in_splash):
                     reason = "yellow_health" if hp_trigger else f"splash_score_{splash_score:.1f}"
                     _, gmask = compute_action_masks(card_counts, hero_states, spatial[7], heal_slot)

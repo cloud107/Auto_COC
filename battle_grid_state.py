@@ -697,20 +697,53 @@ class GuardianTracker:
         self.tmpl_mask = mask
         self.badge_pos = np.array([float(cx), float(cy)], dtype=float)
         self.init_badge = self.badge_pos.copy()
-        # Auto-calibrate badge -> ground-feet offset directly from the pre-battle shrine & [5] badge!
+        # Pedestal offset when perched on shrine vs ground-level walking offset (measured +10px X, +41px Y below [5] badge)
         delta = self.shrine_px - self.init_badge
         self.foot_offset = np.array([float(np.clip(delta[0], 0.0, 32.0)), float(np.clip(delta[1], 45.0, 92.0))], dtype=float)
+        self.walk_foot_offset = np.array([10.0, 41.0], dtype=float)
+
+    @staticmethod
+    def _has_badge_glyph(patch_bgr) -> bool:
+        """Verify a candidate [5] badge patch actually has dark badge background + bright white digit pixels."""
+        if patch_bgr is None or patch_bgr.size == 0:
+            return False
+        hsv = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
+        s, v = hsv[:, :, 1], hsv[:, :, 2]
+        dark_frac = float(np.count_nonzero(v < 95)) / max(1, v.size)
+        white_px = int(np.count_nonzero((v >= 185) & (s <= 75)))
+        return dark_frac >= 0.20 and white_px >= 5
 
     def observe(self, frame_bgr, now: float, transform=None):
         """Leap-proof continuous Guardian tracking across the entire base; returns (feet_px | None, awake)."""
+        if self.tmpl is None or self.badge_pos is None or self.init_badge is None:
+            return (self.shrine_px.copy(), False) if self.alive else (None, False)
+        anchor = (transform @ np.r_[self.init_badge, 1.0]) if transform is not None else self.init_badge
+        inv = cv2.invertAffineTransform(transform) if transform is not None else None
+        th, tw = self.tmpl.shape
+
+        # Step 0: Check if the [5] badge is STILL sitting right at the shrine (init_badge)!
+        # While the Guardian has not moved off its shrine, NEVER let a nearby damaged defense's purple HP bar hijack it!
+        ix, iy = int(round(anchor[0])), int(round(anchor[1]))
+        sx0, sx1 = max(0, ix - tw // 2 - 5), min(frame_bgr.shape[1], ix + tw // 2 + 6)
+        sy0, sy1 = max(0, iy - th // 2 - 5), min(frame_bgr.shape[0], iy + th // 2 + 6)
+        if sx1 - sx0 >= tw and sy1 - sy0 >= th:
+            shrine_sub = frame_bgr[sy0:sy1, sx0:sx1]
+            shrine_gray = cv2.cvtColor(shrine_sub, cv2.COLOR_BGR2GRAY)
+            shrine_res = cv2.matchTemplate(shrine_gray, self.tmpl, cv2.TM_CCOEFF_NORMED, mask=self.tmpl_mask)
+            shrine_res = np.nan_to_num(shrine_res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            _, shrine_sc, _, (su, sv) = cv2.minMaxLoc(shrine_res)
+            if shrine_sc >= 0.78 and self._has_badge_glyph(shrine_sub[sv:sv + th, su:su + tw]):
+                cand_scr = np.array([sx0 + su + tw / 2.0, sy0 + sv + th / 2.0])
+                self.badge_pos = (inv @ np.r_[cand_scr, 1.0]) if inv is not None else cand_scr
+                self.last_seen = now
+                self.alive = True
+                self.awake = False
+                return (self.badge_pos + self.foot_offset), False
+
         if not self.alive:
             return None, False
-        if self.tmpl is None or self.badge_pos is None or self.init_badge is None:
-            return self.shrine_px.copy(), False
-        # Search around BOTH current tracked position (follows Guardian across the whole map!) and shrine (initial leap).
-        anchor = (transform @ np.r_[self.init_badge, 1.0]) if transform is not None else self.init_badge
+
         prev_scr = (transform @ np.r_[self.badge_pos, 1.0]) if transform is not None else self.badge_pos
-        inv = cv2.invertAffineTransform(transform) if transform is not None else None
         # Velocity-gated search radius so nearby defending Heroes ([100]/[115]) can NEVER hijack the Guardian!
         dt_gap = max(0.0, now - self.last_seen) if self.last_seen > 0.0 else 0.0
         max_step = 80.0 if not self.awake else min(115.0, 32.0 + 38.0 * dt_gap)
@@ -721,7 +754,6 @@ class GuardianTracker:
         cy_max = max(anchor[1], prev_scr[1]) if not self.awake else prev_scr[1]
         xl, yl = max(0, int(round(cx_min)) - rad), max(55, int(round(cy_min)) - rad)
         xr, yr = min(VIEWPORT[0], int(round(cx_max)) + rad), min(820, int(round(cy_max)) + rad)
-        th, tw = self.tmpl.shape
         if xr - xl > tw + 32 and yr - yl > th + 4:
             sub_bgr = frame_bgr[yl:yr, xl:xr]
             gray = cv2.cvtColor(sub_bgr, cv2.COLOR_BGR2GRAY)
@@ -730,13 +762,16 @@ class GuardianTracker:
             best_cand_ref = None
             best_score = -1e9
 
-            # Pass 1: template match peaks (>= 0.65) strictly within velocity gate + purple HP bar verification
-            ys, xs = np.where(res >= 0.65)
+            # Pass 1: template match peaks (>= 0.72) strictly within velocity gate + real [5] glyph + purple HP bar
+            ys, xs = np.where(res >= 0.72)
             if len(xs) > 0:
                 order = np.argsort(res[ys, xs])[::-1][:30]
                 for k in order:
                     u, v_i = int(xs[k]), int(ys[k])
                     sc = float(res[v_i, u])
+                    cur_patch = sub_bgr[v_i:v_i + th, u:u + tw]
+                    if not self._has_badge_glyph(cur_patch):
+                        continue
                     cand_scr = np.array([xl + u + tw / 2.0, yl + v_i + th / 2.0])
                     dist_prev = float(np.linalg.norm(cand_scr - prev_scr))
                     if dist_prev > max_step:
@@ -747,7 +782,6 @@ class GuardianTracker:
                         rx, ry = int(round(cand_ref[0] - tw / 2.0)), int(round(cand_ref[1] - th / 2.0))
                         if 0 <= rx and rx + tw <= self.pre_bgr.shape[1] and 0 <= ry and ry + th <= self.pre_bgr.shape[0]:
                             pre_patch = self.pre_bgr[ry:ry + th, rx:rx + tw]
-                            cur_patch = sub_bgr[v_i:v_i + th, u:u + tw]
                             if float(np.abs(cur_patch.astype(np.int16) - pre_patch.astype(np.int16)).mean()) < 18.0:
                                 continue
                     bx_s, by_s = u + tw, v_i + th // 2
@@ -756,13 +790,14 @@ class GuardianTracker:
                     if strip.size > 0:
                         sh, ss, sv = cv2.split(cv2.cvtColor(strip, cv2.COLOR_BGR2HSV))
                         purple_px = int(np.count_nonzero((sh >= 125) & (sh <= 170) & (ss >= 65) & (sv >= 80)))
-                    if purple_px >= 6 or (sc >= 0.85 and dist_init >= 8.0):
+                    if purple_px >= 6 or (sc >= 0.88 and dist_init >= 8.0):
                         combined = sc - 0.0020 * dist_prev
                         if combined > best_score:
                             best_score = combined
                             best_cand_ref = cand_ref
 
-            # Pass 2: purple-HP-bar-first fallback strictly within velocity gate AND requiring real [5] match (>= 0.60)
+            # Pass 2: purple-HP-bar-first fallback strictly requiring BOTH real [5] glyph AND match >= 0.70
+            # (rejects damaged defense buildings that have purple HP bars with NO level badge!)
             if best_cand_ref is None:
                 sub_hsv = cv2.cvtColor(sub_bgr, cv2.COLOR_BGR2HSV)
                 ph, ps, pv = cv2.split(sub_hsv)
@@ -785,9 +820,12 @@ class GuardianTracker:
                         continue
                     local_res = res[v0:v1, u0:u1]
                     _, lsc, _, (lu, lv) = cv2.minMaxLoc(local_res)
-                    if lsc < 0.60:
+                    if lsc < 0.70:
                         continue
                     u, v_i = u0 + lu, v0 + lv
+                    cur_patch = sub_bgr[v_i:v_i + th, u:u + tw]
+                    if not self._has_badge_glyph(cur_patch):
+                        continue
                     cand_scr = np.array([xl + u + tw / 2.0, yl + v_i + th / 2.0])
                     dist_prev = float(np.linalg.norm(cand_scr - prev_scr))
                     if dist_prev > max_step:
@@ -798,7 +836,6 @@ class GuardianTracker:
                         rx, ry = int(round(cand_ref[0] - tw / 2.0)), int(round(cand_ref[1] - th / 2.0))
                         if 0 <= rx and rx + tw <= self.pre_bgr.shape[1] and 0 <= ry and ry + th <= self.pre_bgr.shape[0]:
                             pre_patch = self.pre_bgr[ry:ry + th, rx:rx + tw]
-                            cur_patch = sub_bgr[v_i:v_i + th, u:u + tw]
                             if float(np.abs(cur_patch.astype(np.int16) - pre_patch.astype(np.int16)).mean()) < 16.0:
                                 continue
                     combined = lsc - 0.0022 * dist_prev
@@ -817,7 +854,8 @@ class GuardianTracker:
                 # Guardian woke up and engaged, then its [5]+purple HP bar vanished for >=7s -> KO'd!
                 self.alive = False
                 return None, False
-        return (self.badge_pos + self.foot_offset), self.awake
+        offset = self.walk_foot_offset if self.awake else self.foot_offset
+        return (self.badge_pos + offset), self.awake
 
 
 def detect_enemy_hero_bars(image, pre_bgr, roi):
