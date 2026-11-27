@@ -90,6 +90,9 @@ class GridBuilding:
     cone_half_angle_rad: float | None = None
     mode: str | None = None
     is_non_defense: bool = False
+    bbox_vp: tuple[float, float, float, float] | None = None  # (x1, y1, x2, y2) in 1200x960 viewport
+    hp_frac: float = 1.0
+    hp_seen_at: float = -1.0
 
     def covers_tile(self, tile, max_range: float | None = None, margin: float = 0.0) -> bool:
         """Return True if this building can attack `tile` (respecting directional cone if known)."""
@@ -312,6 +315,11 @@ class BattlefieldGridEncoder:
     def __init__(self, layout, profiles, grid, pre_image, reference_gray):
         self.grid = grid
         self.buildings: list[GridBuilding] = []
+        self.guardian: GridBuilding | None = None
+        pre_rgb_full = np.asarray(pre_image.convert("RGB"), dtype=np.uint8)
+        self.pre_bgr = cv2.resize(
+            cv2.cvtColor(pre_rgb_full, cv2.COLOR_RGB2BGR), VIEWPORT, interpolation=cv2.INTER_AREA
+        )
         self._init_buildings(layout, profiles, reference_gray)
 
         # Ch 7: Legal outer-lawn deployment mask from normalized 1000x800 pre-deployment screenshot
@@ -473,6 +481,12 @@ class BattlefieldGridEncoder:
                 facing_rad=facing_rad,
                 cone_half_angle_rad=cone_half,
                 mode=det_mode,
+                bbox_vp=(
+                    float(x1 * VIEWPORT[0] / width),
+                    float(y1 * VIEWPORT[1] / height),
+                    float(x2 * VIEWPORT[0] / width),
+                    float(y2 * VIEWPORT[1] / height),
+                ),
             )
             self.buildings.append(b)
             if name in GUARDIAN_CLASSES:
@@ -511,6 +525,98 @@ class BattlefieldGridEncoder:
                     b.last_seen = now
                     break
             b.alive = matched or ((now - b.last_seen) <= 1.5)
+            if not b.alive:
+                b.hp_frac = 0.0
+
+    def update_building_hp(self, now: float, transform, frame_bgr: np.ndarray, army_tile=None) -> None:
+        """Estimate live remaining HP fraction [0, 1] for alive defenses near the army from their purple+dark HP bars."""
+        if frame_bgr is None:
+            return
+        if frame_bgr.shape[:2] != VIEWPORT[::-1]:
+            frame_bgr = cv2.resize(frame_bgr, VIEWPORT, interpolation=cv2.INTER_AREA)
+        pre_aligned = (
+            cv2.warpAffine(self.pre_bgr, transform, VIEWPORT)
+            if (transform is not None and not np.allclose(transform, [[1, 0, 0], [0, 1, 0]], atol=0.5))
+            else self.pre_bgr
+        )
+        for b in self.buildings:
+            if not b.alive:
+                b.hp_frac = 0.0
+                continue
+            if b.bbox_vp is None or b.name in GUARDIAN_CLASSES:
+                continue
+            if army_tile is not None and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) > 11.5:
+                continue
+            x1, y1, x2, _ = b.bbox_vp
+            top_pt = np.array([(x1 + x2) * 0.5, y1], dtype=float)
+            if transform is not None:
+                top_pt = transform @ np.r_[top_pt, 1.0]
+            cx, by1 = int(round(top_pt[0])), int(round(top_pt[1]))
+            rx0, rx1 = max(0, cx - 28), min(VIEWPORT[0], cx + 28)
+            ry0, ry1 = max(50, by1 - 24), min(820, by1 + 10)
+            if rx1 - rx0 < 20 or ry1 - ry0 < 10:
+                continue
+            sub_bgr = frame_bgr[ry0:ry1, rx0:rx1]
+            pre_sub = pre_aligned[ry0:ry1, rx0:rx1]
+            diff = np.abs(sub_bgr.astype(np.int16) - pre_sub.astype(np.int16)).mean(axis=2)
+            hsv = cv2.cvtColor(sub_bgr, cv2.COLOR_BGR2HSV)
+            h, s, v = cv2.split(hsv)
+            purple = (h >= 130) & (h <= 168) & (s >= 90) & (v >= 85) & (diff >= 18.0)
+            dark_bar = (v < 100) & (s < 130)
+            dark_border = v < 98
+
+            # Scan horizontal 3px bands for a valid building HP bar (purple fill + contiguous dark empty slot)
+            ref_w = 40.0 if b.is_town_hall else 27.0
+            best_obs = None
+            best_score = -1.0
+            _, _, stats, _ = cv2.connectedComponentsWithStats(purple.astype(np.uint8))
+            for xp, yp, wp, hp_h, area in stats[1:]:
+                if not (1 <= wp <= 46 and 2 <= hp_h <= 5 and area >= 0.50 * wp * hp_h):
+                    continue
+                if yp < 2 or yp + hp_h + 2 > sub_bgr.shape[0]:
+                    continue
+                # Reject defending Hero bars that have bright white level digits immediately to the left
+                left_box = hsv[max(0, yp - 3):yp + hp_h + 3, max(0, xp - 14):max(0, xp - 1)]
+                if left_box.size > 0 and int(np.count_nonzero((left_box[:, :, 1] <= 70) & (left_box[:, :, 2] >= 190))) >= 8:
+                    continue
+                band_y0, band_y1 = yp, yp + hp_h
+                # Extend rightward across contiguous dark empty HP slot
+                end = xp + wp - 1
+                while end + 1 < sub_bgr.shape[1]:
+                    col_p = purple[band_y0:band_y1, end + 1].any()
+                    col_d = dark_bar[band_y0:band_y1, end + 1].mean() >= 0.35
+                    if col_p or col_d:
+                        end += 1
+                    else:
+                        break
+                w_tot = end - xp + 1
+                # Verify dark outline above or below the purple+empty bar
+                outline = max(
+                    dark_border[max(0, yp - 2):yp, xp:end + 1].mean(),
+                    dark_border[yp + hp_h:min(sub_bgr.shape[0], yp + hp_h + 2), xp:end + 1].mean(),
+                )
+                if outline < 0.30:
+                    continue
+                # A real damaged building bar either has a dark empty tail (w_tot>=12) or wide purple fill (wp>=8)
+                if w_tot < 12 and wp < 8:
+                    continue
+                if w_tot > 48:
+                    continue
+                denom = max(float(w_tot), ref_w)
+                hp_obs = float(np.clip(wp / denom, 0.03, 1.0))
+                # Prefer bar centered horizontally above the building bbox
+                center_err = abs((xp + w_tot * 0.5) - (sub_bgr.shape[1] * 0.5))
+                sc = outline * 2.0 + (1.0 if 20 <= w_tot <= 44 else 0.3) - 0.04 * center_err
+                if sc > best_score:
+                    best_score = sc
+                    best_obs = hp_obs
+
+            if best_obs is not None:
+                if best_obs < b.hp_frac:
+                    b.hp_frac = 0.25 * b.hp_frac + 0.75 * best_obs
+                else:
+                    b.hp_frac = 0.85 * b.hp_frac + 0.15 * best_obs
+                b.hp_seen_at = now
 
     def _splat_disk(self, channel: np.ndarray, center, radius: float, value: float, add: bool = True):
         dist_sq = (self._gx - center[0]) ** 2 + (self._gy - center[1]) ** 2
@@ -530,6 +636,7 @@ class BattlefieldGridEncoder:
         *,
         transform=None,
         gray=None,
+        frame_bgr: np.ndarray | None = None,
         army_groups: list[dict] | None = None,
         extra_heroes: list[tuple[float, float]] | None = None,
         active_spells: list[dict] | None = None,
@@ -541,6 +648,14 @@ class BattlefieldGridEncoder:
         if transform is not None and gray is not None:
             self.update_alive_buildings(now, transform, gray)
         inv = cv2.invertAffineTransform(transform) if transform is not None else None
+        army_hint_tile = None
+        if army_groups:
+            c_px = np.asarray(army_groups[0]["center"], dtype=float)
+            if inv is not None:
+                c_px = inv @ np.r_[c_px, 1.0]
+            army_hint_tile = self.viewport_to_tile(c_px)
+        if frame_bgr is not None:
+            self.update_building_hp(now, transform, frame_bgr, army_tile=army_hint_tile)
 
         spatial = np.zeros((len(SPATIAL_CHANNELS), GRID_SIZE, GRID_SIZE), dtype=np.float32)
 
@@ -549,11 +664,12 @@ class BattlefieldGridEncoder:
             if not b.alive:
                 continue
             alive_count += 1
+            hp_w = max(0.25, float(b.hp_frac))
             if b.is_town_hall:
-                self._splat_gaussian(spatial[0], b.tile, sigma=1.6, weight=1.0)
+                self._splat_gaussian(spatial[0], b.tile, sigma=1.6, weight=hp_w)
             elif b.is_core:
-                # Footprint peak + range threat field (directional cone if known)
-                self._splat_gaussian(spatial[1], b.tile, sigma=1.2, weight=1.0)
+                # Footprint peak + range threat field (directional cone if known), scaled by remaining HP
+                self._splat_gaussian(spatial[1], b.tile, sigma=1.2, weight=hp_w)
                 if b.outer_range > 0:
                     dx = self._gx - b.tile[0]
                     dy = self._gy - b.tile[1]
@@ -564,9 +680,9 @@ class BattlefieldGridEncoder:
                     else:
                         r_eff = min(b.outer_range, 10.5) if b.cone_half_angle_rad is not None else b.outer_range
                         in_rng = (dist >= b.min_range) & (dist <= r_eff)
-                    spatial[1][in_rng] += 0.25
+                    spatial[1][in_rng] += 0.25 * hp_w
             else:
-                self._splat_gaussian(spatial[2], b.tile, sigma=1.2, weight=1.0)
+                self._splat_gaussian(spatial[2], b.tile, sigma=1.2, weight=hp_w)
 
         # Ch 3: Alive zero-label non-defense buildings
         for nb in self.non_defense_buildings:

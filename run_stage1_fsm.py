@@ -685,6 +685,7 @@ def run_stage1(adb, args):
                 elapsed_main,
                 transform=tr,
                 gray=gray,
+                frame_bgr=frame,
                 army_groups=groups,
                 active_spells=fsm.active_spells,
                 card_counts=card_counts,

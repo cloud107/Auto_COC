@@ -419,10 +419,11 @@ class PotentialFieldFSM:
                     totem_anchor = guardian_tile
                     totem_reason = f"totem_pull_{guardian.name}"
             elif now >= 10.0:
-                # Fallback when no Guardian detected: drop Totem behind the closest heavy core defense attacking the army
+                # Fallback when no Guardian detected: drop Totem behind the closest healthy (>=25% HP) heavy core defense
                 heavy = [
                     b for b in state.get("alive_buildings", [])
                     if b.name in ("monolith", "inferno_tower", "firespitter", "scattershot", "revenge_tower")
+                    and getattr(b, "hp_frac", 1.0) >= 0.25
                     and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 8.5
                 ]
                 if heavy:
@@ -562,32 +563,60 @@ class PotentialFieldFSM:
                         continue
                     max_r = b.outer_range - 0.3 if b.facing_rad is not None else min(b.outer_range - 0.3, 10.5)
                     if b.covers_tile(army_tile, max_range=max_r, margin=0.3):
-                        splash_score += w
+                        # Discount nearly-dead defenses (e.g. 10% HP Firespitter about to die in <1s!)
+                        hp_f = min(1.0, max(0.0, float(getattr(b, "hp_frac", 1.0))) / 0.35)
+                        splash_score += w * hp_f
 
-                # Count unfrozen alive defenses within 6.0 tiles so we NEVER drop Heal in an empty transit zone!
-                nearby_defs = [
+                # Only count HEALTHY (hp_frac >= 0.30) unfrozen defenses as stay anchors:
+                # if the troops are only finishing off a sliver-HP building, they will immediately move on!
+                stay_defs = [
                     b for b in unfrozen_alive
-                    if math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 6.0
+                    if float(getattr(b, "hp_frac", 1.0)) >= 0.30
+                    and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 6.0
                 ]
-                has_stay_pocket = len(nearby_defs) >= 2 or splash_score >= 2.2
+                has_stay_pocket = len(stay_defs) >= 2 or splash_score >= 2.2
+                # Even if current target is dying (<30% HP), allow critical yellow-HP Heal if a healthy next target is nearby!
+                next_healthy_defs = [
+                    b for b in alive
+                    if float(getattr(b, "hp_frac", 1.0)) >= 0.35
+                    and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 8.5
+                ]
+                critical_hp = sustained_low_hp and yellow_cnt >= 3 and (yellow_cnt / max(1, len(bars))) >= 0.45
                 hp_trigger = (
                     sustained_low_hp
-                    and has_stay_pocket
-                    and (splash_score >= 1.5 or yellow_cnt >= 3)
+                    and (
+                        (has_stay_pocket and (splash_score >= 1.5 or yellow_cnt >= 3))
+                        or (critical_hp and len(next_healthy_defs) >= 1)
+                    )
                 )
 
-                # Keep Heal tightly anchored ON / just ahead of the army (<=1.6 tiles) toward nearby defenses (<=5.5t)
-                # so the main army is ALWAYS well inside the Heal circle and never left outside an empty corner!
+                # Heal placement with dying-building lookahead:
+                # Exclude sliver-HP (<30%) defenses from pocket centroid; if current target is nearly dead,
+                # lead Heal toward the NEXT healthy compartment (<=8.5t) so troops walk right into the Heal!
                 lead = np.zeros(2, dtype=float)
-                max_lead = 1.5 if hp_trigger else 1.7
-                lead_frac = 0.50 if hp_trigger else 0.58
-                pocket = [
+                healthy_close = [
                     b for b in alive
-                    if math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 5.5
+                    if float(getattr(b, "hp_frac", 1.0)) >= 0.30
+                    and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 5.5
                 ]
+                if healthy_close:
+                    max_lead = 1.5 if hp_trigger else 1.7
+                    lead_frac = 0.50 if hp_trigger else 0.58
+                    pocket = healthy_close
+                elif next_healthy_defs:
+                    # Current defense is dying (<30% HP) -> look ahead toward the next healthy compartment!
+                    max_lead = 2.4
+                    lead_frac = 0.62
+                    pocket = next_healthy_defs
+                else:
+                    max_lead = 1.4
+                    lead_frac = 0.45
+                    pocket = []
+
                 if pocket:
                     weights = np.array([
-                        (2.5 if b.is_splash else (1.8 if b.is_core else 0.8))
+                        float(getattr(b, "hp_frac", 1.0))
+                        * (2.5 if b.is_splash else (1.8 if b.is_core else 0.8))
                         / max(1.5, math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]))
                         for b in pocket
                     ], dtype=float)
@@ -633,7 +662,7 @@ class PotentialFieldFSM:
             best_prio = 0.0
             for b in state.get("alive_buildings", []):
                 prio = FREEZE_PRIORITY_DEFENSES.get(b.name, 0.0)
-                if prio <= 0:
+                if prio <= 0 or float(getattr(b, "hp_frac", 1.0)) < 0.25:
                     continue
                 dist = math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1])
                 eff_range = b.outer_range if b.outer_range > 0 else 8.0
