@@ -162,15 +162,18 @@ class HealingWaveTracker:
     def _detect_warden(self, fr_small, pre_small, now):
         pred = self.warden_kf.predict(now, q_pos=10.0, q_vel=30.0)
         diff = fr_small - pre_small
-        # Grand Warden's aura is bright pale green-white (G >= B and G >= R).
-        # Strongly suppress cyan/blue Freeze & Ice Golem frost rings (B > G) and magenta Rage rings (R,B > G)
-        # so spell rings can NEVER hijack the Warden anchor!
+        # Grand Warden's aura rim brightens ALL 3 BGR channels simultaneously (pale glowing white-lime).
+        # Taking min(db, dg, dr) cleanly rejects:
+        #   - destroyed dark buildings revealing green grass (dg+ while db~0)
+        #   - golden yellow Heal spell overlap (dr+, dg+ while db<=0)
+        #   - cyan/blue Freeze & Ice Golem frost rings (db+ while dr<=0)
+        #   - magenta Rage rings (dr+, db+ while dg<=0)
         db, dg, dr = diff[:, :, 0], diff[:, :, 1], diff[:, :, 2]
         pos_map = np.clip(
-            dg - np.maximum(0.0, db - dg) * 1.8 - np.maximum(0.0, dr - dg) * 1.2,
+            np.minimum(np.minimum(db, dg), dr) - np.maximum(0.0, db - dg) * 1.5,
             0.0,
-            50.0,
-        ) / 50.0
+            45.0,
+        ) / 45.0
         pos_map[:35, :] = 0
         pos_map[410:, :] = 0
         # Mask out the bottom-right 1x speed button & destruction HUD so they never create false ring peaks

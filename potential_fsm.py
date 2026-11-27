@@ -476,9 +476,9 @@ class PotentialFieldFSM:
             pushed_deep = math.hypot(army_tile[0] - self.entry_center[0], army_tile[1] - self.entry_center[1]) >= self.warden_min_push_tiles
         warden_covers_army = False
         if warden_tile is not None and army_tile is not None:
-            # Warden Tome radius is ~8.0 tiles: require main army centroid to be <= 5.8 tiles from Warden
-            # so Eternal Tome actually protects the bulk of the army (not popped while Warden lags behind!).
-            warden_covers_army = math.hypot(warden_tile[0] - army_tile[0], warden_tile[1] - army_tile[1]) <= 5.8
+            # Warden Tome radius is ~8.5 tiles: require main army centroid to be <= 6.8 tiles from Warden
+            # so Eternal Tome actually protects the bulk of the army (not popped while Warden lags far behind!).
+            warden_covers_army = math.hypot(warden_tile[0] - army_tile[0], warden_tile[1] - army_tile[1]) <= 6.8
         elif now >= 26.0 and army_tile is not None:
             # Late emergency fallback only if Warden aura couldn't be visually locked
             warden_covers_army = True
