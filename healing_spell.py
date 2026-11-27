@@ -164,18 +164,21 @@ class HealingWaveTracker:
     def _detect_warden(self, fr_small, pre_small, now):
         pred = self.warden_kf.predict(now, q_pos=10.0, q_vel=30.0)
         diff = fr_small - pre_small
-        # Grand Warden's aura rim brightens ALL 3 BGR channels simultaneously (pale glowing white-lime).
-        # Taking min(db, dg, dr) cleanly rejects:
-        #   - destroyed dark buildings revealing green grass (dg+ while db~0)
-        #   - golden yellow Heal spell overlap (dr+, dg+ while db<=0)
-        #   - cyan/blue Freeze & Ice Golem frost rings (db+ while dr<=0)
-        #   - magenta Rage rings (dr+, db+ while dg<=0)
+        # Grand Warden's aura rim is a BRIGHT glowing white-lime ring (all 3 channels brighten AND absolute G >= 150).
+        # Requiring absolute brightness (fr_g >= 150) + min(db, dg, dr) cleanly rejects:
+        #   - destroyed dark walls turning into dull brown/gray rubble (fr_g < 145)
+        #   - destroyed buildings revealing green grass (db ~ 0)
+        #   - golden yellow Heal spell (db <= 0)
+        #   - cyan/blue Freeze & Ice Golem frost rings (db >> dg and dr <= 0)
+        #   - magenta Rage rings (dg <= 0)
         db, dg, dr = diff[:, :, 0], diff[:, :, 1], diff[:, :, 2]
+        bright_aura = (fr_small[:, :, 1] >= 150.0) & (fr_small[:, :, 1] >= fr_small[:, :, 0] - 10.0)
         pos_map = np.clip(
-            np.minimum(np.minimum(db, dg), dr) - np.maximum(0.0, db - dg) * 1.5,
+            np.minimum(np.minimum(db, dg), dr) - np.maximum(0.0, db - dg) * 1.6,
             0.0,
             45.0,
         ) / 45.0
+        pos_map *= bright_aura.astype(np.float32)
         pos_map[:35, :] = 0
         pos_map[410:, :] = 0
         # Mask out the bottom-right 1x speed button & destruction HUD so they never create false ring peaks
@@ -215,18 +218,32 @@ class HealingWaveTracker:
                 psr = (maxv - mean_v) / std_v
                 det = np.array([(mx + tw // 2) * 2.0, (my + th // 2) * 2.0])
 
-        # Global reacquire inside the playable diamond if local failed (tightened on initial lock to block flank frost!)
-        if psr < 5.0 and (self.warden_seen is None or gap >= 0.6):
-            _, gmax, _, (gx, gy) = cv2.minMaxLoc(res_masked)
-            if gmax > -1e8:
-                gpsr = (gmax - mean_v) / std_v
-                gdet = np.array([(gx + tw // 2) * 2.0, (gy + th // 2) * 2.0])
+        # Always evaluate global peak inside the valid diamond (costs ~0.05ms since matchTemplate already ran):
+        # 1) Global reacquire if local peak is weak (psr < 5.0), OR
+        # 2) Domination override: if the real glowing Warden elsewhere has dramatically higher PSR
+        #    (gpsr >= 8.5 and gpsr >= psr + 2.8), snap immediately so a static rubble ring (psr ~ 5-6)
+        #    can NEVER trap Warden while the real PSR 12-18 aura walks away!
+        _, gmax, _, (gx, gy) = cv2.minMaxLoc(res_masked)
+        snapped_global = False
+        if gmax > -1e8:
+            gpsr = (gmax - mean_v) / std_v
+            gdet = np.array([(gx + tw // 2) * 2.0, (gy + th // 2) * 2.0])
+            if gpsr >= 8.5 and gpsr >= psr + 2.8:
+                det, psr = gdet, gpsr
+                snapped_global = True
+            elif psr < 5.0 and (self.warden_seen is None or gap >= 0.6):
                 max_jump = 125.0 if self.warden_seen is None else min(170.0, 55.0 + 55.0 * gap)
                 if gpsr >= 6.2 and np.linalg.norm(gdet - pred) <= max_jump:
                     det, psr = gdet, gpsr
 
         self.warden_psr = psr
         if det is not None and psr >= 4.5:
+            if snapped_global and np.linalg.norm(det - pred) > 90.0:
+                # Re-initialize KF cleanly at the dominating global Warden peak (no huge fake velocity spike!)
+                self.warden_kf = _Kalman2D(det, pos_std=18.0, vel_std=35.0, damping=1.0)
+                self.warden_kf.last_t = now
+                self.warden_seen = now
+                return self.warden_kf.state[:2].copy(), True
             if self.warden_seen is None or np.linalg.norm(det - pred) <= max(45.0, 58.0 * max(0.1, gap)):
                 self.warden_kf.update(det, sigma=10.0 if psr >= 6.5 else 16.0, max_speed=65.0)
                 self.warden_seen = now
