@@ -1001,21 +1001,74 @@ def detect_enemy_hero_bars(image, pre_bgr, roi):
 
 
 class TrajectoryRecorder:
-    """Record 10Hz (S_spatial, S_global, masks, a_slot, a_grid) steps for Stage 2 Behavior Cloning."""
+    """Record 10Hz Stage 2 trajectories (S_spatial, S_extra, S_global, masks, a_slot, a_grid, episode reward)."""
 
     def __init__(self):
         self.spatials = []
+        self.extras = []  # 5x44x44 dynamic Stage 2 channels: [army_hurt, guardian, enemy_heroes, active_heal, active_freeze]
         self.globals = []
+        self.hero_hps = []
         self.slot_masks = []
         self.grid_masks = []
         self.slots = []
         self.grids = []
         self.times = []
+        yy, xx = np.mgrid[:GRID_SIZE, :GRID_SIZE]
+        self._gx = xx.astype(np.float32) + 0.5
+        self._gy = yy.astype(np.float32) + 0.5
 
-    def add(self, state: dict, action) -> None:
-        self.times.append(float(state["time"]))
+    def _splat(self, ch: np.ndarray, tile, sigma: float = 1.3, weight: float = 1.0):
+        dist_sq = (self._gx - float(tile[0])) ** 2 + (self._gy - float(tile[1])) ** 2
+        ch += weight * np.exp(-0.5 * dist_sq / (sigma ** 2))
+
+    def _disk(self, ch: np.ndarray, tile, radius: float, val: float):
+        mask = ((self._gx - float(tile[0])) ** 2 + (self._gy - float(tile[1])) ** 2) <= (radius ** 2)
+        ch[mask] = np.maximum(ch[mask], val)
+
+    def add(
+        self,
+        state: dict,
+        action,
+        *,
+        army_groups: list[dict] | None = None,
+        live_guardian_tile=None,
+        enemy_hero_tiles: list | None = None,
+        active_spells: list[dict] | None = None,
+        hero_hps: dict[int, float] | None = None,
+    ) -> None:
+        now = float(state["time"])
+        self.times.append(now)
         self.spatials.append(state["spatial"].astype(np.float16))
         self.globals.append(state["global"].astype(np.float32))
+        extra = np.zeros((5, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+        # Extra Ch 0: Weighted army hurt heat (length-inverse hurt_ratio at army_tile)
+        if state.get("army_tile") is not None and army_groups:
+            hm = army_groups[0].get("hp_mass", {})
+            hr = float(hm.get("hurt_ratio", 0.0))
+            if hr > 0.0:
+                self._splat(extra[0], state["army_tile"], sigma=2.0, weight=hr)
+        # Extra Ch 1: Live tracked Guardian position
+        g_tile = live_guardian_tile
+        if g_tile is None and state.get("guardian") is not None and state["guardian"].alive:
+            g_tile = state["guardian"].tile
+        if g_tile is not None:
+            self._splat(extra[1], g_tile, sigma=1.4, weight=1.0)
+        # Extra Ch 2: Defending enemy heroes
+        for et in (enemy_hero_tiles or []):
+            self._splat(extra[2], et, sigma=1.3, weight=1.0)
+        # Extra Ch 3 & 4: Separate active Heal (slot 11) and active Freeze (slot 12) rings
+        for sp in (active_spells or []):
+            rem = float(sp["end"] - now)
+            if rem <= 0:
+                continue
+            frac = min(1.0, rem / max(0.1, float(sp["duration"])))
+            if sp["slot"] == 11:
+                self._disk(extra[3], sp["tile"], float(sp["radius"]), frac)
+            elif sp["slot"] == 12:
+                self._disk(extra[4], sp["tile"], float(sp["radius"]), frac)
+        self.extras.append(extra.astype(np.float16))
+        hps = hero_hps or {}
+        self.hero_hps.append(np.array([float(hps.get(s, 0.0)) for s in (7, 8, 9, 10)], dtype=np.float32))
         self.slot_masks.append(
             action.slot_mask if action.slot_mask is not None else np.ones(NUM_SLOTS + 1, dtype=bool)
         )
@@ -1028,18 +1081,22 @@ class TrajectoryRecorder:
         else:
             self.grids.append((-1, -1))
 
-    def save(self, path) -> int:
+    def save(self, path, *, final_destruction: int | None = None, final_stars: int | None = None) -> int:
         if not self.times:
             return 0
         np.savez_compressed(
             str(path),
             times=np.asarray(self.times, dtype=np.float32),
             S_spatial=np.stack(self.spatials, axis=0),
+            S_extra=np.stack(self.extras, axis=0),
             S_global=np.stack(self.globals, axis=0),
+            hero_hps=np.stack(self.hero_hps, axis=0),
             slot_mask=np.stack(self.slot_masks, axis=0),
             grid_mask=np.stack(self.grid_masks, axis=0),
             a_slot=np.asarray(self.slots, dtype=np.int16),
             a_grid=np.asarray(self.grids, dtype=np.int16),
+            final_destruction=np.int16(-1 if final_destruction is None else int(final_destruction)),
+            final_stars=np.int16(-1 if final_stars is None else int(final_stars)),
         )
         return len(self.times)
 

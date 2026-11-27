@@ -375,15 +375,25 @@ class PotentialFieldFSM:
         if primary and primary.get("source") == "health_bars":
             self.bar_history.append((now, len(bars)))
         self.bar_history = [(ts, cnt) for ts, cnt in self.bar_history if now - ts <= 0.7]
-        # Track sustained yellow/red damage: >=2 yellow/red bars (>=35%) for splash assist,
-        # while non-splash perimeter requires >=5 yellow/red bars (>=50%, e.g. Giant Bomb) so 2-3 stray red troops never waste Heal.
-        low_hp_now = (
+        # Track sustained yellow/red damage using BOTH discrete bar counts AND anti-stacking weighted pixel mass
+        # (w_green=1.0, w_yellow=2.2, w_red=4.5) so vertically stacked Miner/Hog bars never vanish!
+        hp_mass = primary.get("hp_mass", {}) if primary else {}
+        hurt_mass = float(hp_mass.get("hurt_mass", 0.0))
+        hurt_ratio = float(hp_mass.get("hurt_ratio", 0.0))
+        bar_low_hp = (
             primary is not None
             and primary.get("source") == "health_bars"
             and len(bars) >= 3
             and yellow_cnt >= 2
             and (yellow_cnt / len(bars)) >= 0.35
         )
+        mass_low_hp = (
+            primary is not None
+            and primary.get("source") in ("health_bars", "single_bar", "warden_anchor")
+            and hurt_mass >= 160.0
+            and hurt_ratio >= 0.38
+        )
+        low_hp_now = bar_low_hp or mass_low_hp
         sustained_low_hp = (
             low_hp_now
             and (self.yellow_seen_at is not None)
@@ -508,7 +518,10 @@ class PotentialFieldFSM:
             # Real HP-loss override during RC's 7s freeze: NEVER trigger on bar-count dip alone (Miners burrow
             # underground and healed troops hide full-HP bars!). Require sustained yellow/red troop damage OR Warden HP drop!
             real_hp_dropping = (
-                (sustained_low_hp and yellow_cnt >= 4 and (yellow_cnt / max(1, len(bars))) >= 0.45)
+                (sustained_low_hp and (
+                    (yellow_cnt >= 4 and (yellow_cnt / max(1, len(bars))) >= 0.45)
+                    or (hurt_mass >= 240.0 and hurt_ratio >= 0.45)
+                ))
                 or ((warden_hp is not None) and (warden_hp <= 0.45 or warden_hp_drop >= 0.22))
             )
             rc_freeze_active = now < self.rc_ability_end
@@ -584,10 +597,14 @@ class PotentialFieldFSM:
                     and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 8.5
                 ]
                 # Heal trigger balance:
-                # 1) No splash (<2.0) on perimeter: ignore 2-3 stray red troops; only Heal on swarm-wide burst (e.g. Giant Bomb: >=5 yellow/red, >=50%).
-                # 2) Single healthy splash (2.0..3.1): Heal once splash starts hurting (>=2 yellow/red sustained).
-                # 3) Heavy unfrozen multi-splash (>=3.2, healthy defenses): proactive Heal IMMEDIATELY even on green bars so army doesn't get burst!
-                critical_hp = sustained_low_hp and yellow_cnt >= 5 and (yellow_cnt / max(1, len(bars))) >= 0.50
+                # 1) No splash (<2.0) on perimeter: ignore 2-3 stray red troops; only Heal on swarm-wide burst
+                #    (e.g. Giant Bomb: >=5 yellow/red bars >=50%, OR stacked hurt_mass >= 300 & hurt_ratio >= 0.48).
+                # 2) Single healthy splash (2.0..3.1): Heal once splash starts hurting (>=2 yellow/red or hurt_mass>=160 sustained).
+                # 3) Heavy unfrozen multi-splash (>=3.2, healthy defenses): proactive Heal IMMEDIATELY even on green bars!
+                critical_hp = sustained_low_hp and (
+                    (yellow_cnt >= 5 and (yellow_cnt / max(1, len(bars))) >= 0.50)
+                    or (hurt_mass >= 300.0 and hurt_ratio >= 0.48)
+                )
                 hp_trigger = (
                     sustained_low_hp
                     and (

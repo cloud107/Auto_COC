@@ -83,6 +83,54 @@ def detect_troop_health_bars(image, pre_bgr, roi):
     return bars
 
 
+def measure_cluster_hp_mass(image, pre_bgr, center, radius=72.0):
+    """Anti-stacking troop HP measurement using length-inverse weighted neon bar pixel area.
+
+    Because green bars (~75% width) are naturally longer than yellow (~35%) and red (~15%) bars,
+    we weight pixel counts by (1.0, 2.2, 4.5) to recover the true fraction of injured troops even
+    when 10+ Miner/Hog health bars stack vertically into one merged blob!
+    """
+    cx, cy = int(round(center[0])), int(round(center[1]))
+    rad = int(round(max(42.0, min(95.0, radius + 18.0))))
+    x0, y0 = max(0, cx - rad), max(75, cy - rad)
+    x1, y1 = min(image.shape[1], cx + rad), min(820, cy + rad)
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return {"green_mass": 0.0, "yellow_mass": 0.0, "red_mass": 0.0, "hurt_mass": 0.0, "hurt_ratio": 0.0}
+    reg = image[y0:y1, x0:x1]
+    pre_reg = pre_bgr[y0:y1, x0:x1]
+    diff_pre = np.abs(reg.astype(np.int16) - pre_reg.astype(np.int16)).mean(axis=2)
+    h, s, v = cv2.split(cv2.cvtColor(reg, cv2.COLOR_BGR2HSV))
+    # Require dark bar outline within +/-3px vertically so grass/fire/Heal glow never count as bar pixels
+    dark = (v < 108).astype(np.uint8)
+    vert_kernel = np.ones((7, 1), dtype=np.uint8)
+    near_dark = cv2.dilate(dark, vert_kernel) > 0
+    valid = near_dark & (diff_pre >= 18.0)
+
+    green_px = int(np.count_nonzero(
+        valid & (
+            ((h >= 44) & (h <= 70) & (s >= 140) & (v >= 130))
+            | ((h >= 37) & (h <= 70) & (s >= 105) & (v >= 175) & (diff_pre >= 22.0))
+        )
+    ))
+    yellow_px = int(np.count_nonzero(valid & (h >= 19) & (h <= 36) & (s >= 150) & (v >= 165)))
+    red_px = int(np.count_nonzero(valid & ((h <= 18) | (h >= 170)) & (s >= 160) & (v >= 140)))
+
+    # Length-inverse weighting: green (~75% bar) = 1.0, yellow (~35% bar) = 2.2, red (~15% bar) = 4.5
+    g_mass = float(green_px) * 1.0
+    y_mass = float(yellow_px) * 2.2
+    r_mass = float(red_px) * 4.5
+    hurt_mass = y_mass + r_mass
+    total = g_mass + hurt_mass
+    hurt_ratio = (hurt_mass / total) if total >= 35.0 else 0.0
+    return {
+        "green_mass": round(g_mass, 1),
+        "yellow_mass": round(y_mass, 1),
+        "red_mass": round(r_mass, 1),
+        "hurt_mass": round(hurt_mass, 1),
+        "hurt_ratio": round(hurt_ratio, 3),
+    }
+
+
 class _Kalman2D:
     """Damped constant-velocity 2D Kalman filter."""
 
@@ -480,6 +528,7 @@ class HealingWaveTracker:
 
         age = (now - self.army_bar_seen) if self.army_bar_seen is not None else (now - self.deployed_at)
         uncertainty = float(2 * np.sqrt(np.linalg.eigvalsh(self.army_kf.cov[:2, :2])[-1]))
+        hp_mass = measure_cluster_hp_mass(frame, pre_aligned, self.army_kf.state[:2], self.army_radius)
         group = {
             "id": 1,
             "center": self.army_kf.state[:2].tolist(),
@@ -493,6 +542,7 @@ class HealingWaveTracker:
                 {"point": p.tolist(), "yellow": cname in ("yellow", "red"), "color": cname}
                 for p, cname in selected_bars
             ],
+            "hp_mass": hp_mass,
             "warden": warden_pos.tolist() if warden_active else None,
             "warden_psr": round(self.warden_psr, 2),
         }

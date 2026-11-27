@@ -38,7 +38,7 @@ from miner_hog_opening import (
     stage_card_changes,
 )
 from potential_fsm import PotentialFieldFSM, SLOTS, score_entry_sides
-from read_destruction import read_result
+from read_destruction import read_result, read_stars
 from recognize_hud import (
     BATTLE_REFERENCE,
     CARD_CENTERS,
@@ -533,6 +533,11 @@ def run_stage1(adb, args):
         last_revive_attempt_at = -99.0
         revive_pending_hero: int | None = None
         revive_attempts = 0
+        clean_dir = (args.output / "clean_frames") if args.save_clean_frames else None
+        if clean_dir is not None:
+            clean_dir.mkdir(parents=True, exist_ok=True)
+        last_clean_save = -99.0
+        clean_idx = 0
         for sample in frames:
             ts, img, frame, phase, capture_ms, source = sample
             if ts - finished >= 150:
@@ -684,6 +689,7 @@ def run_stage1(adb, args):
             )
             hero_hps = {
                 SLOTS["dragon_duke"]: dragon_hud_hp_main,
+                SLOTS["archer_queen"]: hero_hp_fraction(img, SLOTS["archer_queen"]),
                 SLOTS["grand_warden"]: warden_hud_hp,
                 SLOTS["royal_champion"]: rc_hud_hp,
             }
@@ -694,7 +700,18 @@ def run_stage1(adb, args):
                 hero_hps=hero_hps,
             )
             if recorder is not None:
-                recorder.add(state, act)
+                recorder.add(
+                    state, act,
+                    army_groups=groups,
+                    live_guardian_tile=live_guardian_tile,
+                    enemy_hero_tiles=enemy_tiles,
+                    active_spells=fsm.active_spells,
+                    hero_hps=hero_hps,
+                )
+            if clean_dir is not None and (elapsed_main - last_clean_save) >= 1.5:
+                clean_idx += 1
+                last_clean_save = elapsed_main
+                cv2.imwrite(str(clean_dir / f"frame_{clean_idx:04d}_{int(elapsed_main*10):04d}.jpg"), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
 
             target_vp = None
             if act.slot != 0:
@@ -734,11 +751,8 @@ def run_stage1(adb, args):
                     live_guardian_tile=live_guardian_tile,
                 )
 
-    if recorder is not None:
-        saved = recorder.save(args.output / "bc-trajectory.npz")
-        report["bc_steps_recorded"] = saved
-
-    # Wait for the result screen AND let the animated destruction counter settle (3s) before OCR
+    # Fast result settlement: as soon as result screen appears, poll every 0.35s and lock immediately
+    # once 2 consecutive reads agree (typically ~0.8-1.2s instead of blind 3.0s wait!).
     if result_image is None:
         deadline = time.monotonic() + 45.0
         while time.monotonic() < deadline:
@@ -746,20 +760,46 @@ def run_stage1(adb, args):
             if cand_phase == "result":
                 result_image = cand_img
                 break
-            time.sleep(1.5)
+            time.sleep(0.5)
     if result_image is not None:
-        time.sleep(3.0)
-        _, settled_img, settled_phase = read_frame(adb, templates)
-        if settled_phase == "result":
-            result_image = settled_img
+        prev_pair = None
+        final_stars = read_stars(result_image)
+        final_dest = None
+        settle_deadline = time.monotonic() + 3.5
+        while time.monotonic() < settle_deadline:
+            try:
+                cur_dest = read_result(result_image, ROOT)
+            except Exception as exc:
+                report["final_destruction_error"] = str(exc)
+                cur_dest = None
+            cur_stars = read_stars(result_image)
+            final_stars = cur_stars
+            if cur_dest is not None:
+                final_dest = cur_dest
+                cur_pair = (cur_stars, cur_dest)
+                if prev_pair == cur_pair:
+                    break
+                prev_pair = cur_pair
+            time.sleep(0.35)
+            _, next_img, next_phase = read_frame(adb, templates)
+            if next_phase == "result":
+                result_image = next_img
+            else:
+                # User or game already left result screen -> keep the last valid result frame!
+                break
         result_image.save(args.output / "result.png")
-        try:
-            report["final_destruction"] = read_result(result_image, ROOT)
-        except Exception as exc:
-            report["final_destruction_error"] = str(exc)
+        report["final_stars"] = final_stars
+        report["final_destruction"] = final_dest
         if video_recorder is not None:
             res_bgr = cv2.cvtColor(np.asarray(result_image.convert("RGB")), cv2.COLOR_RGB2BGR)
             video_recorder.write_still(res_bgr, seconds=2.5)
+    if recorder is not None:
+        saved = recorder.save(
+            args.output / "bc-trajectory.npz",
+            final_destruction=report.get("final_destruction"),
+            final_stars=report.get("final_stars"),
+        )
+        report["bc_steps_recorded"] = saved
     if video_recorder is not None:
         video_recorder.close()
     persist()
@@ -816,7 +856,8 @@ def main():
     parser.add_argument("--enable-rc-ability", action="store_true")
     parser.add_argument("--enable-cleanup", action="store_true")
     parser.add_argument("--enable-revive", action="store_true")
-    parser.add_argument("--record-bc", action="store_true", help="Save 10Hz BC dataset to bc-trajectory.npz")
+    parser.add_argument("--record-bc", action="store_true", help="Save 10Hz Stage 2 dataset to bc-trajectory.npz")
+    parser.add_argument("--save-clean-frames", action="store_true", help="Save clean unannotated frames every 1.5s for dynamic battle YOLO")
     parser.add_argument("--no-record-video", action="store_true", help="Disable battle_annotated.mp4 recording")
     parser.add_argument("--zoom-result", type=Path, default=ROOT / "mumu-zoom-result.txt")
     parser.add_argument("--adb", default=default_adb, help="Path to MuMu adb executable")
