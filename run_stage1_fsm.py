@@ -651,8 +651,8 @@ def run_stage1(adb, args):
                         dragon_gray_since = None
                         revive_attempts = 0
 
-            # Revive Spell: reserve strictly for Dragon Duke (once red-flash stops for >=2.5s = true KO);
-            # in endgame, if Dragon Duke is safe, spend Revive on ANY fallen hero (RC -> Queen -> Warden) to maximize value!
+            # Revive Spell: STRICTLY reserved for Dragon Duke (highest solo carry power!) while ANY defense remains alive.
+            # Only fall back to another fallen hero (Queen -> RC -> Warden) when 0 defenses remain & clock is late (time-fail cleanup).
             fallen_target = None
             if (
                 args.enable_revive
@@ -664,20 +664,11 @@ def run_stage1(adb, args):
                     fallen_target = SLOTS["dragon_duke"]
                 else:
                     alive_defs = sum(1 for b in encoder.buildings if b.alive)
-                    total_defs = max(1, len(encoder.buildings))
-                    cleared_frac = 1.0 - (alive_defs / total_defs)
-                    endgame_revive = (
-                        dragon_still_alive
-                        and (
-                            (elapsed_main >= 35.0 and (cleared_frac >= 0.72 or alive_defs <= 5))
-                            or elapsed_main >= 65.0
-                        )
-                    )
-                    if endgame_revive:
-                        if rc_hud_hp <= 0.0:
-                            fallen_target = SLOTS["royal_champion"]
-                        elif not hero_is_alive(img, SLOTS["archer_queen"]):
+                    if dragon_still_alive and alive_defs == 0 and elapsed_main >= 65.0:
+                        if not hero_is_alive(img, SLOTS["archer_queen"]):
                             fallen_target = SLOTS["archer_queen"]
+                        elif rc_hud_hp <= 0.0:
+                            fallen_target = SLOTS["royal_champion"]
                         elif not warden_alive:
                             fallen_target = SLOTS["grand_warden"]
 

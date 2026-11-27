@@ -375,12 +375,14 @@ class PotentialFieldFSM:
         if primary and primary.get("source") == "health_bars":
             self.bar_history.append((now, len(bars)))
         self.bar_history = [(ts, cnt) for ts, cnt in self.bar_history if now - ts <= 0.7]
+        # A Miner/Hog swarm has ~60 troops; 1-3 injured/red bars on single-target fire is normal!
+        # Require >=4 yellow/red bars (>=45% of visible bars) sustained across frames before declaring swarm low-HP.
         low_hp_now = (
             primary is not None
             and primary.get("source") == "health_bars"
-            and len(bars) >= 2
-            and yellow_cnt >= 2
-            and (yellow_cnt / len(bars)) >= 0.35
+            and len(bars) >= 4
+            and yellow_cnt >= 4
+            and (yellow_cnt / len(bars)) >= 0.45
         )
         sustained_low_hp = (
             low_hp_now
@@ -506,7 +508,7 @@ class PotentialFieldFSM:
             # Real HP-loss override during RC's 7s freeze: NEVER trigger on bar-count dip alone (Miners burrow
             # underground and healed troops hide full-HP bars!). Require sustained yellow/red troop damage OR Warden HP drop!
             real_hp_dropping = (
-                (sustained_low_hp and yellow_cnt >= 3 and (yellow_cnt / max(1, len(bars))) >= 0.45)
+                (sustained_low_hp and yellow_cnt >= 4 and (yellow_cnt / max(1, len(bars))) >= 0.45)
                 or ((warden_hp is not None) and (warden_hp <= 0.45 or warden_hp_drop >= 0.22))
             )
             rc_freeze_active = now < self.rc_ability_end
@@ -581,12 +583,15 @@ class PotentialFieldFSM:
                     if float(getattr(b, "hp_frac", 1.0)) >= 0.35
                     and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 8.5
                 ]
-                critical_hp = sustained_low_hp and yellow_cnt >= 3 and (yellow_cnt / max(1, len(bars))) >= 0.45
+                # For a ~60-troop Miner/Hog swarm, 2-3 red/yellow bars without splash is just single-target attrition.
+                # Under real unfrozen splash (>=2.0): trigger on sustained >=4 yellow/red bars (>=45%).
+                # Without splash (<2.0, e.g. Giant Bomb): require sustained >=6 yellow/red bars (>=50%)!
+                critical_hp = sustained_low_hp and yellow_cnt >= 6 and (yellow_cnt / max(1, len(bars))) >= 0.50
                 hp_trigger = (
                     sustained_low_hp
                     and (
-                        (has_stay_pocket and (splash_score >= 1.5 or yellow_cnt >= 3))
-                        or (critical_hp and len(next_healthy_defs) >= 1)
+                        (has_stay_pocket and splash_score >= 2.0)
+                        or (critical_hp and (has_stay_pocket or len(next_healthy_defs) >= 1))
                     )
                 )
 
@@ -641,11 +646,11 @@ class PotentialFieldFSM:
                 in_splash = (
                     not rc_freeze_now
                     and heal_cd >= 6.5
-                    and len(bars) >= 3
+                    and len(bars) >= 4
                     and has_stay_pocket
                     and (
-                        (splash_score >= 3.6 and yellow_cnt >= 1)
-                        or (splash_score >= 4.8 and pushed_deep and len(bars) >= 4)
+                        (splash_score >= 3.8 and yellow_cnt >= 3)
+                        or (splash_score >= 5.0 and pushed_deep and len(bars) >= 5)
                     )
                 )
                 if not already_healing and (hp_trigger or in_splash):
