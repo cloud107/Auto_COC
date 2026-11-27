@@ -375,14 +375,14 @@ class PotentialFieldFSM:
         if primary and primary.get("source") == "health_bars":
             self.bar_history.append((now, len(bars)))
         self.bar_history = [(ts, cnt) for ts, cnt in self.bar_history if now - ts <= 0.7]
-        # A Miner/Hog swarm has ~60 troops; 1-3 injured/red bars on single-target fire is normal!
-        # Require >=4 yellow/red bars (>=45% of visible bars) sustained across frames before declaring swarm low-HP.
+        # Track sustained yellow/red damage: >=2 yellow/red bars (>=35%) for splash assist,
+        # while non-splash perimeter requires >=5 yellow/red bars (>=50%, e.g. Giant Bomb) so 2-3 stray red troops never waste Heal.
         low_hp_now = (
             primary is not None
             and primary.get("source") == "health_bars"
-            and len(bars) >= 4
-            and yellow_cnt >= 4
-            and (yellow_cnt / len(bars)) >= 0.45
+            and len(bars) >= 3
+            and yellow_cnt >= 2
+            and (yellow_cnt / len(bars)) >= 0.35
         )
         sustained_low_hp = (
             low_hp_now
@@ -583,10 +583,11 @@ class PotentialFieldFSM:
                     if float(getattr(b, "hp_frac", 1.0)) >= 0.35
                     and math.hypot(army_tile[0] - b.tile[0], army_tile[1] - b.tile[1]) <= 8.5
                 ]
-                # For a ~60-troop Miner/Hog swarm, 2-3 red/yellow bars without splash is just single-target attrition.
-                # Under real unfrozen splash (>=2.0): trigger on sustained >=4 yellow/red bars (>=45%).
-                # Without splash (<2.0, e.g. Giant Bomb): require sustained >=6 yellow/red bars (>=50%)!
-                critical_hp = sustained_low_hp and yellow_cnt >= 6 and (yellow_cnt / max(1, len(bars))) >= 0.50
+                # Heal trigger balance:
+                # 1) No splash (<2.0) on perimeter: ignore 2-3 stray red troops; only Heal on swarm-wide burst (e.g. Giant Bomb: >=5 yellow/red, >=50%).
+                # 2) Single healthy splash (2.0..3.1): Heal once splash starts hurting (>=2 yellow/red sustained).
+                # 3) Heavy unfrozen multi-splash (>=3.2, healthy defenses): proactive Heal IMMEDIATELY even on green bars so army doesn't get burst!
+                critical_hp = sustained_low_hp and yellow_cnt >= 5 and (yellow_cnt / max(1, len(bars))) >= 0.50
                 hp_trigger = (
                     sustained_low_hp
                     and (
@@ -642,16 +643,15 @@ class PotentialFieldFSM:
                 )
                 # Never waste a preemptive Heal on 100% healthy full-green troops (especially during RC freeze!):
                 # require at least 1 damaged/yellow troop OR genuinely extreme unfrozen multi-splash deep in the core.
+                # Proactive Heal upon entering heavy unfrozen healthy multi-splash (splash_score >= 3.2):
+                # don't wait for green bars to turn yellow/red when entering a Scattershot + Inferno / Firespitter killzone!
                 rc_freeze_now = now < self.rc_ability_end
                 in_splash = (
                     not rc_freeze_now
-                    and heal_cd >= 6.5
-                    and len(bars) >= 4
+                    and heal_cd >= 6.0
+                    and len(bars) >= 3
                     and has_stay_pocket
-                    and (
-                        (splash_score >= 3.8 and yellow_cnt >= 3)
-                        or (splash_score >= 5.0 and pushed_deep and len(bars) >= 5)
-                    )
+                    and splash_score >= 3.2
                 )
                 if not already_healing and (hp_trigger or in_splash):
                     reason = "yellow_health" if hp_trigger else f"splash_score_{splash_score:.1f}"
