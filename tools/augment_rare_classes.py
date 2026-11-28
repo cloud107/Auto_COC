@@ -67,8 +67,12 @@ def main():
     if not img_dir.exists() or not lbl_dir.exists():
         raise SystemExit(f"Expected images/train and labels/train under {args.dataset}")
 
-    # Collect existing real images (ignore previously generated aug_cp_* files)
-    train_imgs = [p for p in sorted(img_dir.glob("*.*")) if not p.stem.startswith("aug_cp_")]
+    # Collect existing real images (ignore .json, classes.txt, and previously generated aug_cp_* files)
+    img_exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+    train_imgs = [
+        p for p in sorted(img_dir.iterdir())
+        if p.is_file() and p.suffix.lower() in img_exts and not p.stem.startswith("aug_cp_")
+    ]
     crops_by_cls: dict[int, list[tuple[np.ndarray, float, float]]] = defaultdict(list)
     counts: dict[int, int] = defaultdict(int)
 
