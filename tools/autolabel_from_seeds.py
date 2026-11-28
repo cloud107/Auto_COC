@@ -86,6 +86,8 @@ def main():
     parser.add_argument("--scales", type=float, nargs="+", default=[0.93, 0.965, 1.0, 1.035, 1.07])
     parser.add_argument("--downscale", type=float, default=0.5, help="Search downscale factor (0.5 = 900x720)")
     parser.add_argument("--trim", type=float, default=0.08, help="Outer border trim fraction when matching template")
+    parser.add_argument("--match-roi", type=float, nargs=4, default=None, metavar=("X0", "Y0", "X1", "Y1"),
+                        help="Optional fractional sub-region inside seed box to match (e.g. 0.0 0.0 0.62 0.72 for fixed shed half of workshop)")
     parser.add_argument("--max-templates", type=int, default=8, help="Max seed templates used per class for speed")
     parser.add_argument("--include-auto-seeds", action="store_true", help="Also harvest templates from boxes carrying description=auto_template (e.g. copy-pasted in X-AnyLabeling)")
     parser.add_argument("--preview-dir", type=Path, default=None, help="Directory to save QA contact sheets")
@@ -124,10 +126,15 @@ def main():
             bw, bh = x2 - x1, y2 - y1
             if bw < 16 or bh < 16:
                 continue
-            # Trim outer margin slightly so varying neighboring grass/walls don't dilute NCC score
-            mx, my = bw * args.trim, bh * args.trim
-            tx1, ty1 = max(0, int(round(x1 + mx))), max(0, int(round(y1 + my)))
-            tx2, ty2 = min(iw, int(round(x2 - mx))), min(ih, int(round(y2 - my)))
+            # Trim outer margin slightly (or crop fixed sub-ROI) so varying parts don't dilute NCC score
+            if args.match_roi is not None:
+                rx0, ry0, rx1, ry1 = args.match_roi
+                tx1, ty1 = max(0, int(round(x1 + bw * rx0))), max(0, int(round(y1 + bh * ry0)))
+                tx2, ty2 = min(iw, int(round(x1 + bw * rx1))), min(ih, int(round(y1 + bh * ry1)))
+            else:
+                mx, my = bw * args.trim, bh * args.trim
+                tx1, ty1 = max(0, int(round(x1 + mx))), max(0, int(round(y1 + my)))
+                tx2, ty2 = min(iw, int(round(x2 - mx))), min(ih, int(round(y2 - my)))
             crop = img[ty1:ty2, tx1:tx2]
             if crop.shape[0] < 10 or crop.shape[1] < 10:
                 continue
@@ -238,11 +245,18 @@ def main():
                     box = (max(0.0, x1), max(0.0, y1), min(float(iw), x2), min(float(ih), y2))
                     if _overlaps_existing(box, existing_boxes):
                         continue
-                    # Color-histogram check on inner candidate crop rejects wrong-color shapes (purple cannon / green tree / wall)
+                    # Color-histogram check on matched sub-crop rejects wrong-color shapes (purple cannon / green tree / wall)
                     bx1, by1, bx2, by2 = map(int, map(round, box))
-                    mx_c = int(round((bx2 - bx1) * args.trim))
-                    my_c = int(round((by2 - by1) * args.trim))
-                    inner = img[by1 + my_c:max(by1 + my_c + 4, by2 - my_c), bx1 + mx_c:max(bx1 + mx_c + 4, bx2 - mx_c)]
+                    if args.match_roi is not None:
+                        rx0, ry0, rx1, ry1 = args.match_roi
+                        bw_c, bh_c = bx2 - bx1, by2 - by1
+                        ix1, iy1 = bx1 + int(round(bw_c * rx0)), by1 + int(round(bh_c * ry0))
+                        ix2, iy2 = bx1 + int(round(bw_c * rx1)), by1 + int(round(bh_c * ry1))
+                        inner = img[max(0, iy1):max(iy1 + 4, iy2), max(0, ix1):max(ix1 + 4, ix2)]
+                    else:
+                        mx_c = int(round((bx2 - bx1) * args.trim))
+                        my_c = int(round((by2 - by1) * args.trim))
+                        inner = img[by1 + my_c:max(by1 + my_c + 4, by2 - my_c), bx1 + mx_c:max(bx1 + mx_c + 4, bx2 - mx_c)]
                     if inner.size == 0:
                         continue
                     chist = _hs_hist(inner)
