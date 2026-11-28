@@ -86,6 +86,7 @@ def main():
     parser.add_argument("--scales", type=float, nargs="+", default=[0.93, 0.965, 1.0, 1.035, 1.07])
     parser.add_argument("--downscale", type=float, default=0.5, help="Search downscale factor (0.5 = 900x720)")
     parser.add_argument("--trim", type=float, default=0.08, help="Outer border trim fraction when matching template")
+    parser.add_argument("--max-templates", type=int, default=8, help="Max seed templates used per class for speed")
     parser.add_argument("--preview-dir", type=Path, default=None, help="Directory to save QA contact sheets")
     parser.add_argument("--apply", action="store_true", help="Write accepted predictions into X-AnyLabeling .json files")
     args = parser.parse_args()
@@ -136,6 +137,9 @@ def main():
             })
 
     for cls in args.classes:
+        if len(templates[cls]) > args.max_templates:
+            step = len(templates[cls]) / args.max_templates
+            templates[cls] = [templates[cls][int(i * step)] for i in range(args.max_templates)]
         print(f"[SEEDS] {cls}: {len(templates[cls])} templates from {[t['src'] for t in templates[cls]]}")
         if not templates[cls]:
             raise SystemExit(f"No seed annotations found for class '{cls}'!")
