@@ -87,6 +87,7 @@ def main():
     parser.add_argument("--downscale", type=float, default=0.5, help="Search downscale factor (0.5 = 900x720)")
     parser.add_argument("--trim", type=float, default=0.08, help="Outer border trim fraction when matching template")
     parser.add_argument("--max-templates", type=int, default=8, help="Max seed templates used per class for speed")
+    parser.add_argument("--include-auto-seeds", action="store_true", help="Also harvest templates from boxes carrying description=auto_template (e.g. copy-pasted in X-AnyLabeling)")
     parser.add_argument("--preview-dir", type=Path, default=None, help="Directory to save QA contact sheets")
     parser.add_argument("--apply", action="store_true", help="Write accepted predictions into X-AnyLabeling .json files")
     args = parser.parse_args()
@@ -104,7 +105,11 @@ def main():
         img_path = jp.with_name(data["imagePath"])
         if not img_path.exists():
             continue
-        seed_shapes = [sh for sh in data.get("shapes", []) if sh.get("label") in args.classes and sh.get("description") != "auto_template"]
+        seed_shapes = [
+            sh for sh in data.get("shapes", [])
+            if sh.get("label") in args.classes
+            and (args.include_auto_seeds or sh.get("description") != "auto_template")
+        ]
         if not seed_shapes:
             continue
         img = cv2.imread(str(img_path))
@@ -138,8 +143,23 @@ def main():
 
     for cls in args.classes:
         if len(templates[cls]) > args.max_templates:
-            step = len(templates[cls]) / args.max_templates
-            templates[cls] = [templates[cls][int(i * step)] for i in range(args.max_templates)]
+            # Greedy farthest-point sampling on (color hist + 16x16 resized BGR) so every skin/level variant is represented
+            feats = []
+            for t in templates[cls]:
+                small = cv2.resize(t["crop"], (16, 16), interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
+                small /= max(1e-6, float(np.linalg.norm(small)))
+                hvec = t["hist"].astype(np.float32).ravel()
+                hvec /= max(1e-6, float(np.linalg.norm(hvec)))
+                feats.append(np.concatenate([small, hvec]))
+            F = np.stack(feats, axis=0)
+            chosen = [0]
+            min_dists = np.linalg.norm(F - F[0], axis=1)
+            for _ in range(args.max_templates - 1):
+                nxt = int(np.argmax(min_dists))
+                chosen.append(nxt)
+                d = np.linalg.norm(F - F[nxt], axis=1)
+                min_dists = np.minimum(min_dists, d)
+            templates[cls] = [templates[cls][i] for i in chosen]
         print(f"[SEEDS] {cls}: {len(templates[cls])} templates from {[t['src'] for t in templates[cls]]}")
         if not templates[cls]:
             raise SystemExit(f"No seed annotations found for class '{cls}'!")
